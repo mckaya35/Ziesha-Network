@@ -1,0 +1,560 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+// Kafes Momentum (Fabio tarzı) – STRATEJİ SÜRÜMÜ
+// Göstergeyle aynı kafes/kırılım/kabul/giriş/yönetim mantığı. Görsel yok.
+// İç simülasyon karar verir; strategy.* çağrıları onu aynalar ve
+// TradingView Strateji Test Aracı sonucu bağımsız olarak hesaplar.
+// Fabio Valentini'nin "kafes" (the cage) mantığının OHLCV uyarlaması.
+// Gerçek order flow (emir defteri, footprint) Pine'da yok; mum gövdesi,
+// göreceli hacim (RVOL) ve VWAP ile TAHMİN edilir.
+// Repaint yok: tüm kararlar yalnızca kapanmış mumda (barstate.isconfirmed)
+// verilir, request.security kullanılmaz.
+// ════════════════════════════════════════════════════════════════════════════
+strategy("Kafes Momentum Strateji (Fabio tarzı)", shorttitle="Kafes-S", overlay=true, commission_type=strategy.commission.percent, commission_value=0.05, slippage=1, process_orders_on_close=false, pyramiding=0, initial_capital=10000, calc_on_every_tick=false)
+
+// ════════════════════════════════════════════════════════════════════════════
+// AYARLAR
+// ════════════════════════════════════════════════════════════════════════════
+const string G_KAFES = "1) Kafes (denge aralığı)"
+const string G_BIAS  = "2) Bias (yön) filtreleri"
+const string G_KIRIL = "3) Kırılım ve kabul"
+const string G_GIRIS = "4) Giriş modelleri"
+const string G_YONET = "5) Pozisyon yönetimi"
+const string G_GUN   = "6) Günlük risk kuralları"
+const string G_TEST  = "7) Test ve istatistik"
+
+// ── Modül 2: Kafes ──
+pencereSecim = input.string("New York açılışı", "Kafes penceresi", options=["New York açılışı", "Londra açılışı", "Asya (UTC 00:00)", "Özel"], group=G_KAFES, tooltip="Kripto için New York açılışı önerilir. Yaz/kış saati time() ile otomatik doğru hesaplanır.")
+sureSecim    = input.string("30", "Kafes süresi (dk) – hazır pencereler", options=["15", "30", "60"], group=G_KAFES, tooltip="New York 09:30, Londra 08:00, Asya 00:00 başlangıcından itibaren süre. Özel pencerede kullanılmaz.")
+ozelSeans    = input.session("0930-1000", "Özel pencere (seans)", group=G_KAFES)
+ozelTz       = input.string("America/New_York", "Özel saat dilimi", group=G_KAFES, tooltip="IANA adı: America/New_York, Europe/London, UTC, Europe/Istanbul ...")
+aktifSaat    = input.float(4.0, "Kafes aktif süresi (saat)", minval=0.5, maxval=20.0, step=0.5, group=G_KAFES, tooltip="Pencere kapandıktan sonra başlar. Süre bitince sinyal üretilmez, açık işlem kapatılır (zaman stopu).")
+darEsik      = input.float(0.5, "Çok dar eşiği (× ATR14)", minval=0.1, step=0.1, group=G_KAFES)
+genisEsik    = input.float(4.0, "Çok geniş eşiği (× ATR14)", minval=0.5, step=0.5, group=G_KAFES)
+
+// ── Modül 3: Bias ──
+vwapFiltre      = input.bool(true, "VWAP yön filtresi", group=G_BIAS, tooltip="LONG: kapanış > VWAP, SHORT: kapanış < VWAP. VWAP kafes penceresinin başından çapalıdır.")
+gunKatsayi      = input.float(1.5, "Güçlü gün eşiği (× ADR20)", minval=1.0, step=0.1, group=G_BIAS, tooltip="Son 2 tamamlanmış günün ikisi de bu eşikten büyükse 'Dengeli gün beklentisi'.")
+gunTipiMod      = input.string("Uyar", "Dengeli gün beklentisinde", options=["Uyar", "Sinyali gizle", "Riski yarıya indir"], group=G_BIAS)
+haftaSonuFiltre = input.bool(true, "Cumartesi–Pazar sinyal yok (UTC)", group=G_BIAS)
+
+// ── Modül 4: Kırılım ve kabul ──
+govdeOran = input.float(70.0, "İnisiyatif: min. gövde (% mum boyu)", minval=30.0, maxval=100.0, step=5.0, group=G_KIRIL)
+boyEsik   = input.float(0.8, "İnisiyatif: min. mum boyu (× ATR14)", minval=0.1, step=0.1, group=G_KIRIL)
+rvolEsik  = input.float(1.5, "Min. RVOL", minval=0.5, step=0.1, group=G_KIRIL, tooltip="RVOL = hacim / SMA(hacim, 20). Hacim verisi yoksa şart otomatik devre dışı kalır.")
+kabulN    = input.int(2, "Kabul için bar sayısı (N)", minval=1, maxval=10, group=G_KIRIL)
+bmM       = input.int(5, "Başarısız müzayede penceresi (M bar)", minval=1, maxval=20, group=G_KIRIL)
+
+// ── Modül 5: Giriş ──
+girisModeli  = input.string("Reload", "Giriş modeli", options=["Momentum", "Reload", "İkisi"], group=G_GIRIS)
+momentumOmur = input.int(3, "Momentum emri geçerlilik (bar)", minval=1, maxval=10, group=G_GIRIS)
+reloadOmur   = input.int(2, "Reload emri geçerlilik (bar)", minval=1, maxval=10, group=G_GIRIS)
+reloadBolge  = input.float(0.25, "Reload bölgesi (± × ATR)", minval=0.05, step=0.05, group=G_GIRIS)
+bekleme      = input.int(5, "Aynı yönde bekleme (bar)", minval=0, maxval=50, group=G_GIRIS)
+ekPayAcik    = input.bool(false, "Stopa ek pay ekle", inline="pay", group=G_GIRIS)
+ekPay        = input.float(0.1, "× ATR", minval=0.0, step=0.05, inline="pay", group=G_GIRIS)
+minRiskAtr   = input.float(0.3, "Min. stop mesafesi (× ATR)", minval=0.05, step=0.05, group=G_GIRIS)
+hedefMod     = input.string("Takip", "Hedef", options=["Takip", "Sabit R"], group=G_GIRIS)
+hedefR       = input.float(3.0, "Sabit hedef (R)", minval=0.5, step=0.5, group=G_GIRIS)
+
+// ── Modül 6: Yönetim ──
+riskSifirR = input.float(1.0, "Risk sıfırlama eşiği (R)", minval=0.5, maxval=1.5, step=0.1, group=G_YONET, tooltip="Fiyat girişten bu kadar R lehe gidince stop giriş + 1 tick'e çekilir.")
+
+// ── Modül 7: Günlük risk ──
+gunlukMaxR     = input.float(3.0, "Günlük durma (−R)", minval=0.5, step=0.5, group=G_GUN, tooltip="Fabio 4R kullanır.")
+gunlukMaxKayip = input.int(3, "Günlük maks. kayıp sayısı", minval=1, maxval=10, group=G_GUN)
+
+// ── Modül 8: Test ──
+komisyon  = input.float(0.05, "Komisyon % (tek yön)", minval=0.0, step=0.01, group=G_TEST)
+kaymaTick = input.int(1, "Kayma (tick)", minval=0, group=G_TEST)
+riskYuzde = input.float(1.0, "İşlem başı risk (% özsermaye)", minval=0.1, maxval=10.0, step=0.1, group=G_TEST, tooltip="Adet = özsermaye × risk% / (giriş − stop). Böylece kâr/zarar yaklaşık R cinsinden okunur.")
+istN      = input.int(200, "İstatistik: son N işlem", minval=10, maxval=2000, group=G_TEST)
+
+
+color C_LONG  = #26a69a
+color C_SHORT = #ef5350
+color C_BM    = #ff9800
+float tick    = syminfo.mintick
+
+// ════════════════════════════════════════════════════════════════════════════
+// YARDIMCI FONKSİYONLAR
+// ════════════════════════════════════════════════════════════════════════════
+// Stop hesabı: ham stop + opsiyonel pay; min. risk altına düşerse genişletilir.
+stopHesapla(int yon, float giris, float hamStop, float atrD, bool payAcik, float payAtr, float minAtr) =>
+    float s = hamStop - yon * (payAcik ? payAtr * atrD : 0.0)
+    float r = yon * (giris - s)
+    if r < minAtr * atrD
+        s := giris - yon * minAtr * atrD
+        r := minAtr * atrD
+    [s, r]
+
+// Engel kontrolü: giriş ile 1R arasında önemli seviye varsa neden döner, yoksa "".
+engelKontrol(int yon, float giris, float risk, float ogy, float ogd, float oku, float oka) =>
+    float ust = yon == 1 ? giris + risk : giris
+    float alt = yon == 1 ? giris : giris - risk
+    string sonuc = ""
+    if not na(ogy) and ogy > alt and ogy < ust
+        sonuc := "Engel: önceki gün yükseği"
+    else if not na(ogd) and ogd > alt and ogd < ust
+        sonuc := "Engel: önceki gün düşüğü"
+    else if not na(oku) and oku > alt and oku < ust
+        sonuc := "Engel: önceki kafes üstü"
+    else if not na(oka) and oka > alt and oka < ust
+        sonuc := "Engel: önceki kafes altı"
+    sonuc
+
+// ════════════════════════════════════════════════════════════════════════════
+// MODÜL 2: KAFES PENCERESİ (zaman)
+// ════════════════════════════════════════════════════════════════════════════
+string bitisNY = sureSecim == "15" ? "0945" : sureSecim == "30" ? "1000" : "1030"
+string bitisLN = sureSecim == "15" ? "0815" : sureSecim == "30" ? "0830" : "0900"
+string bitisAS = sureSecim == "15" ? "0015" : sureSecim == "30" ? "0030" : "0100"
+string seans = switch pencereSecim
+    "New York açılışı" => "0930-" + bitisNY
+    "Londra açılışı" => "0800-" + bitisLN
+    "Asya (UTC 00:00)" => "0000-" + bitisAS
+    => ozelSeans
+string seansTz = switch pencereSecim
+    "New York açılışı" => "America/New_York"
+    "Londra açılışı" => "Europe/London"
+    "Asya (UTC 00:00)" => "UTC"
+    => ozelTz
+// Günler açıkça verilir: kripto 7/24 işlem görür.
+string seansTam = seans + ":1234567"
+
+// Pencere uzunluğu (dk) – uyarı için
+float ozelBas = str.tonumber(str.substring(ozelSeans, 0, 2)) * 60 + str.tonumber(str.substring(ozelSeans, 2, 4))
+float ozelSon = str.tonumber(str.substring(ozelSeans, 5, 7)) * 60 + str.tonumber(str.substring(ozelSeans, 7, 9))
+float ozelDk  = ozelSon - ozelBas <= 0 ? ozelSon - ozelBas + 1440 : ozelSon - ozelBas
+float pencereDk = pencereSecim == "Özel" ? ozelDk : str.tonumber(sureSecim)
+float tfDk = timeframe.in_seconds() / 60.0
+
+// time(): pencere içindeyse bar zamanı, dışındaysa na (DST otomatik)
+float pz = time(timeframe.period, seansTam, seansTz)
+bool pencerede = not na(pz)
+bool pencereBasladi = pencerede and na(pz[1])       // na → dolu: pencerenin ilk barı
+bool pencereBitti = not pencerede and not na(pz[1])  // dolu → na: pencere kapandı
+
+// ════════════════════════════════════════════════════════════════════════════
+// HER BARDA HESAPLANAN SERİLER (ta.* koşul dışında!)
+// ════════════════════════════════════════════════════════════════════════════
+float atr       = ta.atr(14)
+float vwapD     = ta.vwap(hlc3, pencereBasladi)      // kafes başından çapalı VWAP
+float hacimOrt  = ta.sma(volume, 20)
+bool  hacimVar  = not na(volume) and not na(hacimOrt) and hacimOrt > 0
+float rvol      = hacimVar ? volume / hacimOrt : na
+bool  hacimOk   = not hacimVar or rvol >= rvolEsik
+bool  yeniGun   = timeframe.change("D")
+float oncekiKapanis = close[1]
+int   gunNo     = dayofweek(time, "UTC")
+bool  haftaSonu = gunNo == dayofweek.saturday or gunNo == dayofweek.sunday
+
+// İnisiyatif mumu: güçlü gövde, uçta kapanış, yeterli boy
+float mumBoy = high - low
+float govde  = math.abs(close - open)
+bool govdeOk = mumBoy > 0 and govde >= govdeOran / 100.0 * mumBoy
+bool boyOk   = mumBoy >= boyEsik * atr
+bool longInisiyatif  = govdeOk and boyOk and close > open and close - low >= 0.75 * mumBoy
+bool shortInisiyatif = govdeOk and boyOk and close < open and high - close >= 0.75 * mumBoy
+
+// ════════════════════════════════════════════════════════════════════════════
+// DURUM DEĞİŞKENLERİ (var)
+// ════════════════════════════════════════════════════════════════════════════
+// Günlük aralık (ADR) – request.security olmadan
+var float gunH = na
+var float gunL = na
+var float oncekiGunH = na
+var float oncekiGunL = na
+var array<float> gunAralik = array.new<float>()
+var bool dengeliGun = false
+
+// Kafes durumu: 0 Bekleniyor, 1 Oluşuyor, 2 Aktif, 3 Çok dar, 4 Çok geniş, 5 Kapalı
+var int kafesDurum = 0
+var float kafesUst = na
+var float kafesAlt = na
+var float kafesOrta = na
+var int kafesBasZaman = na
+var int aktifBitis = na
+var float oncekiKafesUst = na
+var float oncekiKafesAlt = na
+var int denemeSayisi = 0
+var int bmSayisi = 0
+var bool longIptal = false
+var bool shortIptal = false
+
+// Kurulum: 0 yok, 1 kırılım (kabul bekleniyor), 2 kabul (giriş bekleniyor)
+var int setupDurum = 0
+var int setupYon = 0
+var int kirilimBar = na
+var int kabulBar = na
+var float kabulH = na
+var float kabulL = na
+
+// Bekleyen stop emri
+var bool emirVar = false
+var int emirYon = 0
+var int emirModel = 0          // 1 Momentum, 2 Reload
+var float emirGiris = na
+var float emirStop = na
+var float emirCarpan = 1.0
+var int emirBar = na
+var int emirOmur = 0
+
+// Açık işlem
+var bool islemVar = false
+var int islemYon = 0
+var int islemModel = 0
+var float islemGiris = na
+var float islemPlan = na
+var float islemStop = na
+var float islemRisk = na
+var float islemHedef = na
+var float islemCarpan = 1.0
+var int islemGirisBar = na
+var bool riskSifir = false
+var int islemNo = 0
+var int sonKapanisL = na
+var int sonKapanisS = na
+
+// Günlük risk
+var float gunR = 0.0
+var int gunKayip = 0
+var bool gunlukLimit = false
+var string sonIptal = "—"
+
+// İstatistik (son N işlem)
+var array<float> sonuclar = array.new<float>()
+var array<int> modeller = array.new<int>()
+
+// Çizimler
+
+// Alarm olayları (her bar sıfırlanır)
+bool evKafesTamam = false
+bool evKirilimYukari = false
+bool evKirilimAsagi = false
+bool evKabul = false
+bool evBM = false
+bool evReloadLong = false
+bool evReloadShort = false
+bool evGiris = false
+bool evRiskSifir = false
+bool evIslemKapandi = false
+bool evGunlukLimit = false
+bool emirYeni = false
+
+// ════════════════════════════════════════════════════════════════════════════
+// ANA DURUM MAKİNESİ – yalnızca kapanmış mumda
+// ════════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed
+    bool emirOnce = emirVar
+    // ── MODÜL 3: Günlük aralık biriktirme (gün tipi filtresi) ──
+    if yeniGun
+        if not na(gunH)
+            // Gün bitti → aralığı diziye ekle, son 20 gün kalsın
+            array.push(gunAralik, gunH - gunL)
+            if array.size(gunAralik) > 20
+                array.shift(gunAralik)
+            oncekiGunH := gunH
+            oncekiGunL := gunL
+            int nGun = array.size(gunAralik)
+            if nGun >= 5
+                float adr = array.avg(gunAralik)
+                dengeliGun := array.get(gunAralik, nGun - 1) > gunKatsayi * adr and array.get(gunAralik, nGun - 2) > gunKatsayi * adr
+            else
+                dengeliGun := false
+        gunH := high
+        gunL := low
+    else
+        gunH := na(gunH) ? high : math.max(gunH, high)
+        gunL := na(gunL) ? low : math.min(gunL, low)
+
+    // ── MODÜL 2: Kafes oluşumu ──
+    if pencereBasladi
+        // GEÇİŞ → 1 (Oluşuyor). Yeni gün başlangıcı: önceki kafes saklanır, günlük sayaçlar sıfırlanır.
+        if not na(kafesOrta)
+            oncekiKafesUst := kafesUst
+            oncekiKafesAlt := kafesAlt
+        kafesDurum := 1
+        kafesUst := high
+        kafesAlt := low
+        kafesOrta := na
+        kafesBasZaman := time
+        aktifBitis := na
+        denemeSayisi := 0
+        bmSayisi := 0
+        longIptal := false
+        shortIptal := false
+        setupDurum := 0
+        emirVar := false
+        gunR := 0.0
+        gunKayip := 0
+        gunlukLimit := false
+    else if pencerede and kafesDurum == 1
+        // Pencere boyunca en yüksek / en düşük biriktirilir
+        kafesUst := math.max(kafesUst, high)
+        kafesAlt := math.min(kafesAlt, low)
+
+    if pencereBitti and kafesDurum == 1
+        // GEÇİŞ 1 → 2/3/4: kafes tamamlandı, kalite filtresi uygulanır
+        kafesOrta := (kafesUst + kafesAlt) / 2
+        aktifBitis := time + math.round(aktifSaat * 3600000)
+        float yukseklik = kafesUst - kafesAlt
+        kafesDurum := yukseklik < darEsik * atr ? 3 : yukseklik > genisEsik * atr ? 4 : 2
+        evKafesTamam := true
+    bool kafesAktif = kafesDurum == 2 and not na(aktifBitis) and time < aktifBitis
+    bool sureBitti = kafesDurum >= 2 and not na(aktifBitis) and time_close >= aktifBitis
+
+    // ── MODÜL 8: Bekleyen emir dolumu (kötümser) ──
+    bool girisBari = false
+    if emirVar and not islemVar and bar_index > emirBar
+        bool doldu = emirYon == 1 ? high >= emirGiris : low <= emirGiris
+        if doldu
+            // GEÇİŞ: emir → açık işlem. Gap varsa giriş = açılış.
+            float dolum = emirYon == 1 ? math.max(open, emirGiris) : math.min(open, emirGiris)
+            islemVar := true
+            islemYon := emirYon
+            islemModel := emirModel
+            islemGiris := dolum
+            islemPlan := emirGiris
+            islemStop := emirStop
+            islemRisk := math.abs(emirGiris - emirStop)   // R planlanan riske göre (gap kayması R'ye yansır)
+            islemHedef := hedefMod == "Sabit R" ? emirGiris + emirYon * hedefR * islemRisk : na
+            islemCarpan := emirCarpan
+            islemGirisBar := bar_index
+            riskSifir := false
+            islemNo += 1
+            emirVar := false
+            girisBari := true
+            evGiris := true
+        else if bar_index >= emirBar + emirOmur
+            // GEÇİŞ: emir süresi doldu → iptal
+            emirVar := false
+            sonIptal := (emirModel == 1 ? "Momentum" : "Reload") + " emri tetiklenmedi"
+
+    // ── MODÜL 6/8: Bar içi çıkış (stop önce – kötümser) ──
+    bool kapanis = false
+    float cikisF = na
+    string cikisNeden = ""
+    if islemVar
+        if islemYon == 1
+            if low <= islemStop
+                kapanis := true
+                cikisF := girisBari ? islemStop : math.min(open, islemStop)
+                cikisNeden := riskSifir ? "Takip" : "Stop"
+            else if not na(islemHedef) and high >= islemHedef
+                kapanis := true
+                cikisF := girisBari ? islemHedef : math.max(open, islemHedef)
+                cikisNeden := "Hedef"
+        else
+            if high >= islemStop
+                kapanis := true
+                cikisF := girisBari ? islemStop : math.max(open, islemStop)
+                cikisNeden := riskSifir ? "Takip" : "Stop"
+            else if not na(islemHedef) and low <= islemHedef
+                kapanis := true
+                cikisF := girisBari ? islemHedef : math.min(open, islemHedef)
+                cikisNeden := "Hedef"
+
+    // ── MODÜL 4: Başarısız müzayede (kırılımdan sonraki M bar içinde kafese dönüş) ──
+    if setupDurum > 0 and bar_index > kirilimBar and bar_index - kirilimBar <= bmM
+        bool iceriBM = setupYon == 1 ? close < kafesUst : close > kafesAlt
+        if iceriBM
+            // GEÇİŞ: kurulum → iptal. O yön bu kafes için kapanır.
+            bmSayisi += 1
+            if setupYon == 1
+                longIptal := true
+            else
+                shortIptal := true
+            evBM := true
+            sonIptal := "Başarısız müzayede (" + (setupYon == 1 ? "LONG" : "SHORT") + ")"
+            setupDurum := 0
+            emirVar := false
+            if bmSayisi >= 2
+                // GEÇİŞ → 5 (Kapalı): iki başarısız müzayede = dalgalı kafes
+                kafesDurum := 5
+                sonIptal := "Kafes: dalgalı, işlem yok"
+    // ── MODÜL 6: Kapanış bazlı çıkışlar (BM çıkış, zaman stopu) ──
+    if islemVar and not kapanis
+        bool iceriIslem = islemYon == 1 ? close < kafesUst : close > kafesAlt
+        if iceriIslem
+            kapanis := true
+            cikisF := close
+            cikisNeden := "BM"
+        else if sureBitti
+            kapanis := true
+            cikisF := close
+            cikisNeden := "Zaman"
+
+    // ── İşlem kapanışı: sonuç kaydı ──
+    if kapanis
+        float brutR = islemYon * (cikisF - islemGiris) / islemRisk
+        float maliyet = (2 * komisyon * islemGiris / 100 + 2 * kaymaTick * tick) / islemRisk
+        float netR = (brutR - maliyet) * islemCarpan
+        array.push(sonuclar, netR)
+        array.push(modeller, islemModel)
+        while array.size(sonuclar) > istN
+            array.shift(sonuclar)
+            array.shift(modeller)
+        // Günlük sayaçlar (kayıp = fiyat bazında zarar; başa baş sayılmaz)
+        gunR += netR
+        if brutR < 0
+            gunKayip += 1
+        if not gunlukLimit and (gunR <= -gunlukMaxR or gunKayip >= gunlukMaxKayip)
+            // GEÇİŞ: günlük limit → bugün yeni sinyal yok
+            gunlukLimit := true
+            evGunlukLimit := true
+            sonIptal := "Günlük limit doldu"
+        if islemYon == 1
+            sonKapanisL := bar_index
+        else
+            sonKapanisS := bar_index
+        // GEÇİŞ: işlem → yok; kurulum biter
+        islemVar := false
+        setupDurum := 0
+        evIslemKapandi := true
+
+    // ── MODÜL 6: Risk sıfırlama ve takip eden stop (karar kapanışta, geçerlilik sonraki bar) ──
+    if islemVar
+        float eskiStop = islemStop
+        bool sifirOnce = riskSifir
+        if not riskSifir
+            bool ulasti = islemYon == 1 ? high >= islemGiris + riskSifirR * islemRisk : low <= islemGiris - riskSifirR * islemRisk
+            if ulasti
+                // GEÇİŞ: Risk → Risksiz (stop giriş + 1 tick)
+                float beStop = islemGiris + islemYon * tick
+                islemStop := islemYon == 1 ? math.max(islemStop, beStop) : math.min(islemStop, beStop)
+                riskSifir := true
+                evRiskSifir := true
+        if sifirOnce
+            // Takip: işlem yönündeki her yeni inisiyatif mumunda stop yalnızca lehe taşınır
+            if islemYon == 1 and longInisiyatif
+                islemStop := math.max(islemStop, low - tick)
+            else if islemYon == -1 and shortInisiyatif
+                islemStop := math.min(islemStop, high + tick)
+    // ── Sinyal izin kontrolleri ──
+    string genelEngel = gunlukLimit ? "Günlük limit doldu" : haftaSonuFiltre and haftaSonu ? "Hafta sonu" : dengeliGun and gunTipiMod == "Sinyali gizle" ? "Dengeli gün beklentisi" : ""
+    bool vwapLongOk = not vwapFiltre or na(vwapD) or close > vwapD
+    bool vwapShortOk = not vwapFiltre or na(vwapD) or close < vwapD
+    bool bekLongOk = na(sonKapanisL) or bar_index - sonKapanisL >= bekleme
+    bool bekShortOk = na(sonKapanisS) or bar_index - sonKapanisS >= bekleme
+    float carpanYeni = dengeliGun and gunTipiMod == "Riski yarıya indir" ? 0.5 : 1.0
+
+    // ── MODÜL 4: Kabul ──
+    if setupDurum == 1 and not islemVar
+        kabulH := math.max(kabulH, high)
+        kabulL := math.min(kabulL, low)
+        bool iceriKabul = setupYon == 1 ? close < kafesUst : close > kafesAlt
+        if iceriKabul
+            // GEÇİŞ 1 → 0: (yalnızca N > M ise ulaşılır) kapanış kafese döndü, kabul yok
+            setupDurum := 0
+            sonIptal := "Kabul olmadı"
+        else if bar_index - kirilimBar >= kabulN
+            // GEÇİŞ 1 → 2: N bar boyunca kapanış kafes dışında kaldı → KABUL
+            setupDurum := 2
+            kabulBar := bar_index
+            evKabul := true
+            // ── MODÜL 5A: Momentum emri (kabul mumundan sonra stop emri) ──
+            if girisModeli != "Reload"
+                float gM = setupYon == 1 ? kabulH + tick : kabulL - tick
+                [sM, rM] = stopHesapla(setupYon, gM, setupYon == 1 ? kabulL : kabulH, atr, ekPayAcik, ekPay, minRiskAtr)
+                string nedenM = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "VWAP ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : engelKontrol(setupYon, gM, rM, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
+                if nedenM == ""
+                    emirVar := true
+                    emirYon := setupYon
+                    emirModel := 1
+                    emirGiris := gM
+                    emirStop := sM
+                    emirCarpan := carpanYeni
+                    emirBar := bar_index
+                    emirOmur := momentumOmur
+                    emirYeni := true
+                else
+                    sonIptal := "Momentum: " + nedenM
+
+    // ── MODÜL 5B: Reload (kırılan seviyeye geri çekilme) ──
+    else if setupDurum == 2 and not islemVar and not emirVar and bar_index > kabulBar
+        if girisModeli == "Momentum"
+            // Momentum emri doldu/iptal oldu → kurulum biter
+            setupDurum := 0
+        else
+            float seviye = setupYon == 1 ? math.max(kafesUst, nz(vwapD, kafesUst)) : math.min(kafesAlt, nz(vwapD, kafesAlt))
+            float bolgeUst = seviye + reloadBolge * atr
+            float bolgeAlt = seviye - reloadBolge * atr
+            bool geriDondu = setupYon == 1 ? close < kafesOrta : close > kafesOrta
+            if geriDondu
+                // GEÇİŞ 2 → 0: geri çekilme kafesin ortasına kadar kapandı
+                setupDurum := 0
+                sonIptal := "Reload iptal: fiyat kafese döndü"
+            else
+                // Tetik: bölgeye değ, bölgenin dışında ve mumun lehe yarısında kapat (emilim tahmini)
+                bool tetik = setupYon == 1 ? low <= bolgeUst and close > bolgeUst and close >= low + 0.5 * mumBoy : high >= bolgeAlt and close < bolgeAlt and close <= high - 0.5 * mumBoy
+                if tetik
+                    bool guclu = hacimVar and rvol >= rvolEsik and mumBoy < boyEsik * atr   // yüksek çaba, küçük sonuç
+                    float gR = setupYon == 1 ? high + tick : low - tick
+                    [sR, rR] = stopHesapla(setupYon, gR, setupYon == 1 ? low : high, atr, ekPayAcik, ekPay, minRiskAtr)
+                    string nedenR = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "VWAP ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : engelKontrol(setupYon, gR, rR, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
+                    if setupYon == 1
+                        evReloadLong := true
+                    else
+                        evReloadShort := true
+                    if nedenR == ""
+                        emirVar := true
+                        emirYon := setupYon
+                        emirModel := 2
+                        emirGiris := gR
+                        emirStop := sR
+                        emirCarpan := carpanYeni
+                        emirBar := bar_index
+                        emirOmur := reloadOmur
+                        emirYeni := true
+                    else
+                        sonIptal := "Reload: " + nedenR
+
+    // ── MODÜL 4: Yeni kırılım ──
+    if kafesAktif and setupDurum == 0 and not islemVar and not emirVar and denemeSayisi < 2
+        bool kL = not longIptal and close > kafesUst and oncekiKapanis <= kafesUst and longInisiyatif and hacimOk
+        bool kS = not shortIptal and close < kafesAlt and oncekiKapanis >= kafesAlt and shortInisiyatif and hacimOk
+        if kL or kS
+            if genelEngel != ""
+                sonIptal := "Kırılım yok sayıldı: " + genelEngel
+            else
+                // GEÇİŞ 0 → 1: kırılım, kabul bekleniyor
+                denemeSayisi += 1
+                setupDurum := 1
+                setupYon := kL ? 1 : -1
+                kirilimBar := bar_index
+                kabulH := high
+                kabulL := low
+                if kL
+                    evKirilimYukari := true
+                else
+                    evKirilimAsagi := true
+    // ── Kafes aktif süresi bitti → GEÇİŞ → 0 (Bekleniyor) ──
+    if sureBitti
+        if emirVar
+            sonIptal := "Kafes süresi bitti, emir iptal"
+        kafesDurum := 0
+        setupDurum := 0
+        emirVar := false
+
+    // ════════════════════════════════════════════════════════════════════════
+    // STRATEJİ EMİRLERİ – iç simülasyonun aynası
+    // ════════════════════════════════════════════════════════════════════════
+    // 1) Kapanış bazlı çıkış (BM / Zaman): bu mumun kapanışında kapat
+    if kapanis and strategy.position_size != 0
+        strategy.close("K", comment=cikisNeden, immediately=true)
+    // 2) İç emir iptal oldu (süre / BM / kafes sonu) → bekleyen emri iptal et
+    if emirOnce and not emirVar and not girisBari
+        strategy.cancel("K")
+    // 3) Yeni stop emri + koruyucu çıkış (aynı id önceki emri değiştirir)
+    if emirVar and emirYeni
+        float qty = strategy.equity * riskYuzde / 100 * emirCarpan / math.abs(emirGiris - emirStop)
+        float hdf = hedefMod == "Sabit R" ? emirGiris + emirYon * hedefR * math.abs(emirGiris - emirStop) : na
+        strategy.entry("K", emirYon == 1 ? strategy.long : strategy.short, qty=qty, stop=emirGiris, comment=emirModel == 1 ? "Momentum" : "Reload")
+        strategy.exit("KX", "K", stop=emirStop, limit=hdf, comment_loss="Stop", comment_profit="Hedef")
+    // 4) Açık işlemde güncel stopu (risk sıfırlama / takip) sonraki bar için gönder
+    if islemVar
+        strategy.exit("KX", "K", stop=islemStop, limit=islemHedef, comment_loss=riskSifir ? "Takip" : "Stop", comment_profit="Hedef")
+    // 5) Senkron güvenliği: iç simülasyon düz ama broker pozisyonda ise kapat
+    if not islemVar and not emirVar and strategy.position_size != 0
+        strategy.close_all(comment="Senkron", immediately=true)
