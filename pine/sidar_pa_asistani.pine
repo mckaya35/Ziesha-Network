@@ -1,0 +1,749 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  Sidar PA Asistanı
+//  Sidar Demirgil'in price action kurallarını grafikte görselleştiren yardımcı.
+//
+//  Repaint politikası
+//  • Tüm durum güncellemeleri (pivot, trend, zon, formasyon, sinyal) yalnızca
+//    kapanmış mumda (barstate.isconfirmed) yapılır.
+//  • Üst zaman dilimi verisi lookahead_off ile ve bir bar kaydırılarak ([1]) alınır.
+//  • Pivotlar "sağ bar" sayısı kadar gecikmeyle onaylanır. Etiket pivot mumuna
+//    geriye dönük konur, ancak onay anından önce hiçbir karar o pivotu kullanmaz.
+// ════════════════════════════════════════════════════════════════════════════
+indicator("Sidar PA Asistanı", shorttitle = "Sidar PA", overlay = true,
+     max_lines_count = 100, max_boxes_count = 30, max_labels_count = 400)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  AYARLAR
+// ════════════════════════════════════════════════════════════════════════════
+G1 = "1 · Piyasa yapısı ve trend çizgileri"
+i_m1       = input.bool(true, "Modül 1'i göster (etiket + çizgi)", group = G1)
+i_pvL      = input.int(5, "Pivot sol bar", minval = 1, maxval = 50, group = G1)
+i_pvR      = input.int(5, "Pivot sağ bar (onay gecikmesi)", minval = 1, maxval = 50, group = G1)
+i_pvEt     = input.bool(true, "HH / HL / LH / LL etiketleri", group = G1)
+i_tl       = input.bool(true, "Otomatik trend çizgileri", group = G1)
+i_tlSakla  = input.int(3, "Saklanacak kırılmış çizgi sayısı", minval = 0, maxval = 10, group = G1)
+i_tablo    = input.bool(true, "Trend tablosu", group = G1)
+i_tabloPoz = input.string("Sağ üst", "Tablo konumu", options = ["Sağ üst", "Sağ alt", "Sol üst", "Sol alt"], group = G1)
+
+G2 = "2 · EMA setleri"
+i_m2         = input.bool(true, "Modül 2'yi aç", group = G2)
+i_emaMod     = input.string("Otomatik", "EMA modu", options = ["Otomatik", "Scalp (7/13/26)", "Gün içi (7/14/21)", "Swing (20/50/200)"], group = G2,
+     tooltip = "Otomatik: 5dk ve altı Scalp, 30dk'ya kadar Gün içi, üstü Swing.")
+i_saatFiltre = input.bool(true, "Scalp: 1 saatlik yön filtresi", group = G2)
+i_yelpaze    = input.bool(true, "Scalp: yelpaze arka planı", group = G2)
+i_donus      = input.bool(true, "Gün içi: 'Trend dönüşü' etiketi", group = G2)
+i_ema200     = input.bool(true, "Swing: EMA 200 filtresi", group = G2,
+     tooltip = "Fiyat EMA 200 altındayken LONG, üstündeyken SHORT kurulumlarını gizler.")
+
+G2B = "2b · Algo EMA (adaptif)"
+i_algo      = input.bool(true, "Algo EMA'yı aç", group = G2B)
+i_algoListe = input.string("7,9,12,13,14,15,20,21,26", "Aday periyotlar (virgülle)", group = G2B)
+i_algoTol   = input.float(0.1, "Temas toleransı (× ATR14)", minval = 0.0, step = 0.05, group = G2B,
+     tooltip = "Fitilin EMA'yı en fazla ne kadar geçebileceği. Bağlam filtresi ve kurulumlardaki EMA teması da bu toleransı kullanır.")
+i_algoTest  = input.bool(true, "'Algo testi 2 / 3' işaretleri", group = G2B)
+
+G3 = "3 · Destek / direnç zonları"
+i_m3      = input.bool(true, "Modül 3'ü aç", group = G3)
+i_zMesafe = input.float(0.5, "Kümeleme mesafesi (× ATR14)", minval = 0.1, step = 0.1, group = G3)
+i_zMin    = input.int(2, "Minimum dokunuş", minval = 1, maxval = 10, group = G3)
+i_zUstN   = input.int(3, "Üstte gösterilecek zon", minval = 0, maxval = 8, group = G3)
+i_zAltN   = input.int(3, "Altta gösterilecek zon", minval = 0, maxval = 8, group = G3)
+i_zEtiket = input.bool(true, "'Rol değişti' / 'Tuzak?' etiketleri", group = G3)
+i_zMaks   = input.int(60, "Hafızadaki en fazla küme", minval = 10, maxval = 150, group = G3)
+
+G4 = "4 · Mum formasyonları"
+i_m4        = input.bool(true, "Modül 4'ü aç", group = G4)
+i_ciftYutan = input.bool(true, "2 mumun toplamı ters mumu yutarsa yutan say", group = G4)
+i_pinOran   = input.float(0.66, "Pin bar: uzun fitil / mum boyu", minval = 0.66, maxval = 0.75, step = 0.01, group = G4)
+i_ib        = input.bool(true, "Inside bar", group = G4)
+i_doji      = input.bool(true, "Doji ('Kararsız')", group = G4)
+i_3m        = input.bool(true, "3 mumlu trend sonu dönüşü", group = G4)
+i_baglam    = input.bool(true, "Bağlam filtresi (yalnızca zon / EMA temasında göster)", group = G4)
+
+G5 = "5 · Kurulum sinyali"
+i_m5        = input.bool(true, "Modül 5'i aç", group = G5)
+i_garantici = input.bool(true, "Garantici mod (bölgedeki 1. sinyali atla)", group = G5)
+i_gPencere  = input.int(20, "Garantici: aynı bölge sayılacak en fazla bar", minval = 1, group = G5)
+i_kademe    = input.int(2, "Giriş kademesi (tick)", minval = 1, maxval = 3, group = G5)
+i_stopMod   = input.string("Sinyal mumu", "Stop yeri", options = ["Sinyal mumu", "Son pivot"], group = G5)
+i_atrPay    = input.bool(false, "Stopa ATR ek payı ekle", group = G5)
+i_atrKat    = input.float(1.0, "ATR ek payı (×)", minval = 0.1, step = 0.1, group = G5)
+i_rr        = input.float(2.0, "Hedef R:R", minval = 0.5, step = 0.1, group = G5)
+i_minRR     = input.float(1.5, "Hedef çekilince minimum R:R", minval = 0.5, step = 0.1, group = G5)
+i_maxKur    = input.int(5, "Grafikte tutulacak kurulum", minval = 1, maxval = 15, group = G5)
+
+// ─── Renkler ────────────────────────────────────────────────────────────────
+color cBoga  = #26a69a
+color cAyi   = #ef5350
+color cNotr  = #9e9e9e
+color cAlgo  = #e040fb
+color cEma1  = #f5c518
+color cEma2  = #ff9800
+color cEma3  = #2962ff
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ORTAK HESAPLAR
+// ════════════════════════════════════════════════════════════════════════════
+cf       = barstate.isconfirmed
+atr14    = ta.atr(14)
+govdeUst = math.max(open, close)
+govdeAlt = math.min(open, close)
+govde    = govdeUst - govdeAlt
+boy      = high - low
+kapYer   = boy > 0 ? (close - low) / boy : 0.5   // kapanışın mum içindeki yeri (0 = dip, 1 = tepe)
+
+// Pivot mumuna ait değerler (pivot, sağ bar kadar geriden onaylanır)
+lowR   = low[i_pvR]
+highR  = high[i_pvR]
+closeR = close[i_pvR]
+atrR   = atr14[i_pvR]
+gUstR  = govdeUst[i_pvR]
+gAltR  = govdeAlt[i_pvR]
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MODÜL 1 · PİYASA YAPISI
+// ════════════════════════════════════════════════════════════════════════════
+// Yapı motoru. Hem grafik zaman diliminde hem de üst dilimde (request.security) kullanılır.
+// ok = false iken durum güncellenmez (kapanmamış mum).
+f_yapi(simple int L, simple int R, bool ok) =>
+    float ph = ta.pivothigh(high, L, R)
+    float pl = ta.pivotlow(low, L, R)
+    var float lastH    = na
+    var int   lastHBar = na
+    var float prevH    = na
+    var int   prevHBar = na
+    var float lastL    = na
+    var int   lastLBar = na
+    var float prevL    = na
+    var int   prevLBar = na
+    var int   hTip     = 0      // 1 = HH, -1 = LH
+    var int   lTip     = 0      // 1 = HL, -1 = LL
+    var int   trend    = 0      // 1 yükseliş, -1 düşüş, 0 yatay
+    var float majorH   = na     // düşüşte kapanışla aşılırsa yükselişe dönüş
+    var float majorL   = na     // yükselişte kapanışla kırılırsa düşüşe dönüş
+    bool yeniH   = false
+    bool yeniL   = false
+    int  kirilim = 0
+    if ok
+        if not na(ph)
+            prevH    := lastH
+            prevHBar := lastHBar
+            lastH    := ph
+            lastHBar := bar_index - R
+            hTip     := na(prevH) ? 0 : lastH > prevH ? 1 : -1
+            yeniH    := true
+        if not na(pl)
+            prevL    := lastL
+            prevLBar := lastLBar
+            lastL    := pl
+            lastLBar := bar_index - R
+            lTip     := na(prevL) ? 0 : lastL > prevL ? 1 : -1
+            yeniL    := true
+        // Başlangıç: ilk net HH+HL ya da LH+LL dizilimi trendi belirler
+        if trend == 0
+            if hTip == 1 and lTip == 1
+                trend  := 1
+                majorL := lastL
+            else if hTip == -1 and lTip == -1
+                trend  := -1
+                majorH := lastH
+        // Yükselişte her yeni HH: majör dip = yeni tepeden hemen önceki dip
+        else if trend == 1 and yeniH and hTip == 1
+            majorL := lastL
+        // Düşüşte her yeni LL: majör tepe = yeni dipten hemen önceki tepe
+        else if trend == -1 and yeniL and lTip == -1
+            majorH := lastH
+        // Yapı değişimi yalnızca KAPANIŞLA (fitil sayılmaz)
+        if trend == 1 and not na(majorL) and close < majorL
+            trend   := -1
+            kirilim := -1
+            majorH  := lastH
+        else if trend == -1 and not na(majorH) and close > majorH
+            trend   := 1
+            kirilim := 1
+            majorL  := lastL
+    [trend, kirilim, yeniH, yeniL, hTip, lTip, lastH, lastHBar, prevH, prevHBar, lastL, lastLBar, prevL, prevLBar, majorH, majorL]
+
+[trend, kirilim, yeniH, yeniL, hTip, lTip, sonH, sonHBar, oncH, oncHBar, sonL, sonLBar, oncL, oncLBar, majorH, majorL] = f_yapi(i_pvL, i_pvR, cf)
+
+// ─── Üst zaman dilimi ───────────────────────────────────────────────────────
+// 1dk→5dk, 5dk→30dk, 15dk→1s, 30dk→2s, 1s→4s, 4s→G, G→H (aradaki dilimler en yakın basamağa)
+f_ustZd() =>
+    int s = timeframe.in_seconds()
+    s <= 60 ? "5" : s <= 300 ? "30" : s <= 900 ? "60" : s <= 1800 ? "120" : s <= 3600 ? "240" : s <= 14400 ? "D" : s <= 86400 ? "W" : s <= 604800 ? "M" : "12M"
+
+f_zdAd(string z) =>
+    z == "60" ? "1s" : z == "120" ? "2s" : z == "240" ? "4s" : z == "D" ? "G" : z == "W" ? "H" : z == "M" ? "A" : z == "12M" ? "Y" : z + "dk"
+
+// Üst dilim trendi bir bar kaydırılarak ([1]) döndürülür → yalnızca kapanmış üst dilim mumu kullanılır
+f_ustTrend(simple int L, simple int R) =>
+    [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15] = f_yapi(L, R, true)
+    t0[1]
+
+ustZd    = f_ustZd()
+htfTrend = nz(request.security(syminfo.tickerid, ustZd, f_ustTrend(i_pvL, i_pvR), lookahead = barmerge.lookahead_off))
+uyumlu   = trend != 0 and trend == htfTrend
+
+// Trend başlangıcı / yapı değişimi olayları
+bool yeniTrend = cf and trend != 0 and trend != nz(trend[1])
+bool yapiYukari = yeniTrend and trend == 1
+bool yapiAsagi  = yeniTrend and trend == -1
+
+// ─── HH / HL / LH / LL etiketleri ───────────────────────────────────────────
+if cf and i_m1 and i_pvEt
+    if yeniH and hTip != 0
+        label.new(sonHBar, sonH, hTip == 1 ? "HH" : "LH", yloc = yloc.abovebar, style = label.style_none,
+             textcolor = hTip == 1 ? cBoga : cAyi, size = size.tiny)
+    if yeniL and lTip != 0
+        label.new(sonLBar, sonL, lTip == 1 ? "HL" : "LL", yloc = yloc.belowbar, style = label.style_none,
+             textcolor = lTip == 1 ? cBoga : cAyi, size = size.tiny)
+
+// ─── Otomatik trend çizgileri ───────────────────────────────────────────────
+var line destekTL = na
+var line direncTL = na
+var array<line> kirikTL = array.new<line>()
+
+f_kir(line ln) =>
+    float y = line.get_price(ln, bar_index)
+    line.set_extend(ln, extend.none)
+    line.set_xy2(ln, bar_index, y)
+    line.set_style(ln, line.style_dashed)
+    line.set_width(ln, 1)
+    array.push(kirikTL, ln)
+    while array.size(kirikTL) > i_tlSakla
+        line.delete(array.shift(kirikTL))
+    true
+
+if cf and i_m1 and i_tl
+    // Mumların altı: son iki YÜKSELEN dip (HL)
+    if yeniL and lTip == 1 and not na(oncL)
+        line.delete(destekTL)
+        destekTL := line.new(oncLBar, oncL, sonLBar, sonL, extend = extend.right, color = cBoga, width = 2)
+    // Mumların üstü: son iki ALÇALAN tepe (LH)
+    if yeniH and hTip == -1 and not na(oncH)
+        line.delete(direncTL)
+        direncTL := line.new(oncHBar, oncH, sonHBar, sonH, extend = extend.right, color = cAyi, width = 2)
+    // Kapanışla kırılım → kesik çizgi; yenisi bir sonraki uygun pivot çiftinde çizilir
+    if not na(destekTL) and close < line.get_price(destekTL, bar_index)
+        f_kir(destekTL)
+        destekTL := na
+    if not na(direncTL) and close > line.get_price(direncTL, bar_index)
+        f_kir(direncTL)
+        direncTL := na
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MODÜL 2 · EMA SETLERİ
+// ════════════════════════════════════════════════════════════════════════════
+tfSn   = timeframe.in_seconds()
+emaMod = not i_m2 ? 0 : i_emaMod == "Otomatik" ? (tfSn <= 300 ? 1 : tfSn <= 1800 ? 2 : 3) : i_emaMod == "Scalp (7/13/26)" ? 1 : i_emaMod == "Gün içi (7/14/21)" ? 2 : 3
+len1   = emaMod == 3 ? 20 : 7
+len2   = emaMod == 1 ? 13 : emaMod == 3 ? 50 : 14
+len3   = emaMod == 1 ? 26 : emaMod == 3 ? 200 : 21
+e1     = ta.ema(close, len1)
+e2     = ta.ema(close, len2)
+e3     = ta.ema(close, len3)
+
+plot(emaMod != 0 ? e1 : na, "EMA hızlı", color = cEma1, linewidth = 1)
+plot(emaMod != 0 ? e2 : na, "EMA orta", color = cEma2, linewidth = 1)
+plot(emaMod != 0 ? e3 : na, "EMA yavaş", color = cEma3, linewidth = 2)
+
+// Scalp: 1 saatlik filtre (lookahead_off + [1])
+[h7, h26, hKap] = request.security(syminfo.tickerid, "60", [ta.ema(close, 7)[1], ta.ema(close, 26)[1], close[1]], lookahead = barmerge.lookahead_off)
+saatFiltre = emaMod == 1 and i_saatFiltre ? (h7 > h26 and hKap > h7 ? 1 : h7 < h26 and hKap < h7 ? -1 : 0) : 0
+
+// Scalp: yelpaze arka planı
+color yelpazeRenk = emaMod == 1 and i_yelpaze ? (e1 > e2 and e2 > e3 ? color.new(color.green, 90) : e3 > e2 and e2 > e1 ? color.new(color.red, 90) : na) : na
+bgcolor(yelpazeRenk, title = "Scalp yelpaze")
+
+// Gün içi: trend dönüşü
+var int sonDonus = 0
+bool donusL = false
+bool donusS = false
+if cf and emaMod == 2 and i_donus
+    if sonDonus != 1 and not na(sonH) and close > sonH and e1 > e2 and e2 > e3
+        donusL   := true
+        sonDonus := 1
+    else if sonDonus != -1 and not na(sonL) and close < sonL and e3 > e2 and e2 > e1
+        donusS   := true
+        sonDonus := -1
+plotshape(donusL, "Trend dönüşü (yukarı)", shape.labelup, location.belowbar, cBoga, text = "Trend dönüşü", textcolor = color.white, size = size.small)
+plotshape(donusS, "Trend dönüşü (aşağı)", shape.labeldown, location.abovebar, cAyi, text = "Trend dönüşü", textcolor = color.white, size = size.small)
+
+// Swing: EMA 200 filtresi
+swingEngelL = emaMod == 3 and i_ema200 and close < e3
+swingEngelS = emaMod == 3 and i_ema200 and close > e3
+
+// ─── Algo EMA ───────────────────────────────────────────────────────────────
+f_listeOku(string s) =>
+    array<int>    out    = array.new<int>()
+    array<string> parca  = str.split(s, ",")
+    for p in parca
+        float v = str.tonumber(str.replace_all(p, " ", ""))
+        if not na(v) and v >= 2 and array.size(out) < 20
+            array.push(out, int(v))
+    out
+
+var array<int> algoLen = f_listeOku(i_algoListe)
+nA = array.size(algoLen)
+// Periyot listesi çalışma anında belirlendiği için EMA'lar elle hesaplanır (ta.ema ile aynı formül)
+var array<float>  algoEma  = array.new<float>(nA, na)
+// Satır = aday, sütun = kaç bar önce (0..sağ bar). Pivot mumundaki EMA değerini okumak için.
+var matrix<float> algoHist = matrix.new<float>(math.max(nA, 1), i_pvR + 1, na)
+if nA > 0
+    for i = 0 to nA - 1
+        float a  = 2.0 / (array.get(algoLen, i) + 1.0)
+        float pv = array.get(algoEma, i)
+        array.set(algoEma, i, na(pv) ? close : a * close + (1.0 - a) * pv)
+    matrix.remove_col(algoHist, i_pvR)
+    matrix.add_col(algoHist, 0, array.copy(algoEma))
+
+var int algoIdx     = -1   // seçilen adayın indeksi
+var int algoDurum   = 0    // 0 bekleniyor, 1 seçildi, 2 uygun aday yok
+var int geriSayac   = 0    // trend içindeki geri çekilme sayısı
+var int trendBasBar = na
+
+if yeniTrend
+    algoIdx     := -1
+    algoDurum   := 0
+    geriSayac   := 0
+    trendBasBar := bar_index
+
+if cf and i_algo and nA > 0 and trend != 0
+    bool geriCekilme = (trend == 1 and yeniL and sonLBar > trendBasBar) or (trend == -1 and yeniH and sonHBar > trendBasBar)
+    if geriCekilme
+        geriSayac += 1
+        float tolR  = atrR * i_algoTol
+        float fitil = trend == 1 ? lowR : highR
+        if geriSayac == 1
+            // İlk geri çekilme: fitile en yakın, dokunmuş ve kapanışı trend tarafında kalan EMA
+            int   enIyi = -1
+            float enAz  = 1e20
+            for i = 0 to nA - 1
+                float E = matrix.get(algoHist, i, i_pvR)
+                if not na(E)
+                    bool temas = trend == 1 ? (fitil <= E and fitil >= E - tolR and closeR > E) : (fitil >= E and fitil <= E + tolR and closeR < E)
+                    float d = math.abs(fitil - E)
+                    if temas and d < enAz
+                        enAz  := d
+                        enIyi := i
+            algoIdx   := enIyi
+            algoDurum := enIyi >= 0 ? 1 : 2
+        else if geriSayac <= 3 and algoIdx >= 0 and i_algoTest
+            // 2. ve 3. geri çekilme: Algo EMA'ya değdi mi? (4. dalgadan sonra işaret yok)
+            float E = matrix.get(algoHist, algoIdx, i_pvR)
+            bool degdi = trend == 1 ? fitil <= E + tolR : fitil >= E - tolR
+            if degdi
+                label.new(trend == 1 ? sonLBar : sonHBar, fitil, "Algo testi " + str.tostring(geriSayac),
+                     yloc = trend == 1 ? yloc.belowbar : yloc.abovebar,
+                     style = trend == 1 ? label.style_label_up : label.style_label_down,
+                     color = color.new(cAlgo, 20), textcolor = color.white, size = size.tiny)
+
+float algoDeger = na
+if i_algo and algoIdx >= 0 and algoIdx < nA
+    algoDeger := array.get(algoEma, algoIdx)
+plot(algoDeger, "Algo EMA", color = cAlgo, linewidth = 3, style = plot.style_linebr)
+
+var label algoEt = na
+if barstate.islast
+    label.delete(algoEt)
+    algoEt := na
+    if not na(algoDeger)
+        algoEt := label.new(bar_index + 2, algoDeger, "Algo EMA " + str.tostring(array.get(algoLen, algoIdx)),
+             style = label.style_label_left, color = color.new(cAlgo, 10), textcolor = color.white, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MODÜL 3 · BÖLGESEL DESTEK / DİRENÇ ZONLARI
+// ════════════════════════════════════════════════════════════════════════════
+var array<float> zSev = array.new<float>()   // küme seviyesi (fitil uçlarının ortalaması)
+var array<float> zUst = array.new<float>()   // kutu üstü
+var array<float> zAlt = array.new<float>()   // kutu altı
+var array<int>   zSay = array.new<int>()     // dokunuş sayısı
+var array<int>   zRol = array.new<int>()     // 1 destek, -1 direnç
+var array<int>   zDis = array.new<int>()     // art arda zon dışında kapanış sayısı
+var array<bool>  zDeg = array.new<bool>()    // rol değişti mi
+var array<int>   zIlk = array.new<int>()     // ilk pivot barı
+var array<int>   zSon = array.new<int>()     // son pivot barı
+var array<int>   zId  = array.new<int>()     // kalıcı kimlik (garantici mod için)
+var array<box>   zKutu = array.new<box>()
+
+f_zonSil(int i) =>
+    array.remove(zSev, i)
+    array.remove(zUst, i)
+    array.remove(zAlt, i)
+    array.remove(zSay, i)
+    array.remove(zRol, i)
+    array.remove(zDis, i)
+    array.remove(zDeg, i)
+    array.remove(zIlk, i)
+    array.remove(zSon, i)
+    array.remove(zId, i)
+    true
+
+// Pivotu en yakın kümeye ekler ya da yeni küme açar.
+// Kutu: fitil ucundan o mumun gövdesine kadar olan aralıkların birleşimi.
+f_zonIsle(float p, float kenar, bool tepe, int pBar, float mesafe) =>
+    int   n     = array.size(zSev)
+    int   enIyi = -1
+    float enAz  = mesafe
+    if n > 0
+        for i = 0 to n - 1
+            float d = math.abs(array.get(zSev, i) - p)
+            if d <= enAz
+                enAz  := d
+                enIyi := i
+    float alt = tepe ? kenar : p
+    float ust = tepe ? p : kenar
+    if enIyi >= 0
+        int c = array.get(zSay, enIyi)
+        array.set(zSev, enIyi, (array.get(zSev, enIyi) * c + p) / (c + 1))
+        array.set(zSay, enIyi, c + 1)
+        array.set(zUst, enIyi, math.max(array.get(zUst, enIyi), ust))
+        array.set(zAlt, enIyi, math.min(array.get(zAlt, enIyi), alt))
+        array.set(zSon, enIyi, pBar)
+    else
+        array.push(zSev, p)
+        array.push(zUst, ust)
+        array.push(zAlt, alt)
+        array.push(zSay, 1)
+        array.push(zRol, close > ust ? 1 : close < alt ? -1 : tepe ? -1 : 1)
+        array.push(zDis, 0)
+        array.push(zDeg, false)
+        array.push(zIlk, pBar)
+        array.push(zSon, pBar)
+        array.push(zId, pBar * 2 + (tepe ? 1 : 0))
+        // Hafıza sınırı: en uzun süredir dokunulmayan kümeyi sil
+        if array.size(zSev) > i_zMaks
+            int eski = 0
+            for i = 1 to array.size(zSon) - 1
+                if array.get(zSon, i) < array.get(zSon, eski)
+                    eski := i
+            f_zonSil(eski)
+    true
+
+// Verilen aralığa (lo-hi) değen, yeterli dokunuşlu zonun kimliği; yoksa -1.
+// rol: 0 hepsi, 1 yalnızca destek, -1 yalnızca direnç
+f_zonBul(int rol, float lo, float hi) =>
+    int   sonuc = -1
+    float enAz  = 1e20
+    int   n     = array.size(zSev)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(zSay, i) >= i_zMin and (rol == 0 or array.get(zRol, i) == rol)
+                float t = array.get(zUst, i)
+                float b = array.get(zAlt, i)
+                if lo <= t and hi >= b
+                    float d = math.abs((t + b) / 2 - close)
+                    if d < enAz
+                        enAz  := d
+                        sonuc := array.get(zId, i)
+    sonuc
+
+// Yeni pivotları kümele
+if cf and i_m3
+    float mesafe = atr14 * i_zMesafe
+    if yeniH
+        f_zonIsle(sonH, gUstR, true, sonHBar, mesafe)
+    if yeniL
+        f_zonIsle(sonL, gAltR, false, sonLBar, mesafe)
+
+// Rol değişimi ve tuzak kontrolü (yalnızca kapanışla)
+bool rolDegisti = false
+if cf and i_m3 and array.size(zSev) > 0
+    for i = 0 to array.size(zSev) - 1
+        float t   = array.get(zUst, i)
+        float b   = array.get(zAlt, i)
+        int   rol = array.get(zRol, i)
+        int   dis = array.get(zDis, i)
+        if array.get(zSay, i) < i_zMin
+            // Henüz zon değil: rolü sessizce fiyata göre güncelle
+            rol := close > t ? 1 : close < b ? -1 : rol
+            dis := 0
+        else if rol == -1
+            if close > t
+                dis += 1
+                if dis >= 2
+                    rol := 1
+                    dis := 0
+                    rolDegisti := true
+                    array.set(zDeg, i, true)
+                    if i_zEtiket
+                        label.new(bar_index, b, "Rol değişti", style = label.style_label_up, color = color.new(cBoga, 20), textcolor = color.white, size = size.tiny)
+            else
+                if dis == 1 and i_zEtiket
+                    label.new(bar_index - 1, t, "Tuzak?", style = label.style_label_down, color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+                dis := 0
+        else
+            if close < b
+                dis += 1
+                if dis >= 2
+                    rol := -1
+                    dis := 0
+                    rolDegisti := true
+                    array.set(zDeg, i, true)
+                    if i_zEtiket
+                        label.new(bar_index, t, "Rol değişti", style = label.style_label_down, color = color.new(cAyi, 20), textcolor = color.white, size = size.tiny)
+            else
+                if dis == 1 and i_zEtiket
+                    label.new(bar_index - 1, b, "Tuzak?", style = label.style_label_up, color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+                dis := 0
+        array.set(zRol, i, rol)
+        array.set(zDis, i, dis)
+
+// Kutu çizimi: fiyata en yakın N zon (üstte / altta). Eskiler silinir.
+f_kutuCiz(int i) =>
+    int   c      = array.get(zSay, i)
+    int   r      = array.get(zRol, i)
+    color taban  = r == 1 ? cBoga : cAyi
+    int   saydam = math.max(30, 85 - (c - 2) * 12)   // dokunuş arttıkça koyulaşır
+    string yazi  = (r == 1 ? "Destek" : "Direnç") + " · " + str.tostring(c) + " dokunuş" + (array.get(zDeg, i) ? " · Rol değişti" : "") + (c >= 4 ? "\nÇok test edildi, kırılma riski" : "")
+    box b = box.new(math.max(array.get(zIlk, i), bar_index - 4000), array.get(zUst, i), bar_index + 15, array.get(zAlt, i),
+         border_color = color.new(taban, 40), bgcolor = color.new(taban, saydam), text = yazi, text_size = size.small,
+         text_color = chart.fg_color, text_halign = text.align_right, text_valign = text.align_top)
+    array.push(zKutu, b)
+    true
+
+f_enYakinCiz(array<float> mes, array<int> idx, int k) =>
+    int n = array.size(mes)
+    if n > 0 and k > 0
+        array<int> sira = array.sort_indices(mes, order.ascending)
+        for j = 0 to math.min(k, n) - 1
+            f_kutuCiz(array.get(idx, array.get(sira, j)))
+    true
+
+if barstate.islast
+    for bx in zKutu
+        box.delete(bx)
+    array.clear(zKutu)
+    if i_m3 and array.size(zSev) > 0
+        array<float> ustMes = array.new<float>()
+        array<int>   ustIdx = array.new<int>()
+        array<float> altMes = array.new<float>()
+        array<int>   altIdx = array.new<int>()
+        for i = 0 to array.size(zSev) - 1
+            if array.get(zSay, i) >= i_zMin
+                float t = array.get(zUst, i)
+                float b = array.get(zAlt, i)
+                if b > close or (t >= close and (t + b) / 2 >= close)
+                    array.push(ustMes, math.max(b - close, 0))
+                    array.push(ustIdx, i)
+                else
+                    array.push(altMes, math.max(close - t, 0))
+                    array.push(altIdx, i)
+        f_enYakinCiz(ustMes, ustIdx, i_zUstN)
+        f_enYakinCiz(altMes, altIdx, i_zAltN)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MODÜL 4 · MUM FORMASYONLARI (renk değil, kapanışın yeri önemli)
+// ════════════════════════════════════════════════════════════════════════════
+// 1) Yutan mum
+bogaTek = govdeUst >= govdeUst[1] and govdeAlt <= govdeAlt[1] and govde > govde[1] and close > govdeUst[1] and kapYer >= 0.5
+ayiTek  = govdeUst >= govdeUst[1] and govdeAlt <= govdeAlt[1] and govde > govde[1] and close < govdeAlt[1] and kapYer <= 0.5
+
+// İki mumun toplamı (bir önceki mumun açılışı → bu mumun kapanışı) son ters mumun gövdesini yutuyor mu
+cUst = math.max(open[1], close)
+cAlt = math.min(open[1], close)
+bogaCift = i_ciftYutan and not bogaTek and not bogaTek[1] and close[2] < open[2] and cUst >= govdeUst[2] and cAlt <= govdeAlt[2] and close > govdeUst[2] and kapYer >= 0.5
+ayiCift  = i_ciftYutan and not ayiTek and not ayiTek[1] and close[2] > open[2] and cUst >= govdeUst[2] and cAlt <= govdeAlt[2] and close < govdeAlt[2] and kapYer <= 0.5
+
+// Güçlü yutan: gövdesi art arda birden fazla önceki gövdeyi yutan mum
+f_yutulan() =>
+    int k = 0
+    for i = 1 to 5
+        if govdeUst[i] <= govdeUst and govdeAlt[i] >= govdeAlt
+            k += 1
+        else
+            break
+    k
+yutulanSay = f_yutulan()
+bogaGuclu  = bogaTek and yutulanSay >= 2
+ayiGuclu   = ayiTek and yutulanSay >= 2
+bogaYutan  = bogaTek or bogaCift
+ayiYutan   = ayiTek or ayiCift
+
+// 2) Pin bar: uzun fitil ≥ oran × mum boyu, gövde karşı uçta (rengi önemsiz)
+bogaPin = boy > 0 and (govdeAlt - low) >= i_pinOran * boy
+ayiPin  = boy > 0 and (high - govdeUst) >= i_pinOran * boy
+
+// 3) Inside bar: yalnızca trend içindeki geri çekilmede ve trend yönündeki renkte
+geriBak  = i_pvL * 2
+enYuksek = ta.highest(high, geriBak)
+enDusuk  = ta.lowest(low, geriBak)
+insideBar = high <= high[1] and low >= low[1]
+bogaIB = insideBar and trend == 1 and close > open and high[1] < enYuksek[2]
+ayiIB  = insideBar and trend == -1 and close < open and low[1] > enDusuk[2]
+
+// 4) Doji: gövde < mum boyunun %10'u (sinyal üretmez)
+doji = boy > 0 and govde < 0.1 * boy
+
+// 5) 3 mumlu trend sonu dönüşü: geri çekilme mumu → trend yönünde yutan → 1. mumun gövdesinde kapanış
+uc3Asagi = trend == 1 and close[2] < open[2] and bogaYutan[1] and close >= govdeAlt[2] and close <= govdeUst[2]
+uc3Yukari = trend == -1 and close[2] > open[2] and ayiYutan[1] and close >= govdeAlt[2] and close <= govdeUst[2]
+
+// Bağlam filtresi: zon, aktif EMA seti veya Algo EMA teması
+tolAnlik = atr14 * i_algoTol
+f_dokun(float E) =>
+    not na(E) and low - tolAnlik <= E and high + tolAnlik >= E
+emaDokun = (emaMod != 0 and (f_dokun(e1) or f_dokun(e2) or f_dokun(e3))) or f_dokun(algoDeger)
+zonDokun = f_zonBul(0, low, high) != -1
+baglamOk = not i_baglam or emaDokun or zonDokun
+m4 = i_m4 and cf and baglamOk
+
+plotshape(m4 and bogaGuclu, "Güçlü boğa yutan", shape.triangleup, location.belowbar, cBoga, text = "Güçlü\nyutan", textcolor = cBoga, size = size.small)
+plotshape(m4 and bogaYutan and not bogaGuclu, "Boğa yutan", shape.triangleup, location.belowbar, cBoga, text = "Yutan", textcolor = cBoga, size = size.tiny)
+plotshape(m4 and ayiGuclu, "Güçlü ayı yutan", shape.triangledown, location.abovebar, cAyi, text = "Güçlü\nyutan", textcolor = cAyi, size = size.small)
+plotshape(m4 and ayiYutan and not ayiGuclu, "Ayı yutan", shape.triangledown, location.abovebar, cAyi, text = "Yutan", textcolor = cAyi, size = size.tiny)
+plotshape(m4 and bogaPin, "Boğa pin bar", shape.diamond, location.belowbar, cBoga, text = "Pin", textcolor = cBoga, size = size.tiny)
+plotshape(m4 and ayiPin, "Ayı pin bar", shape.diamond, location.abovebar, cAyi, text = "Pin", textcolor = cAyi, size = size.tiny)
+plotshape(m4 and i_ib and bogaIB, "Boğa inside bar", shape.square, location.belowbar, cBoga, text = "IB", textcolor = cBoga, size = size.tiny)
+plotshape(m4 and i_ib and ayiIB, "Ayı inside bar", shape.square, location.abovebar, cAyi, text = "IB", textcolor = cAyi, size = size.tiny)
+plotshape(m4 and i_doji and doji, "Doji", shape.circle, location.abovebar, cNotr, text = "Kararsız", textcolor = cNotr, size = size.tiny)
+plotshape(m4 and i_3m and uc3Asagi, "3M dönüş (aşağı)", shape.xcross, location.abovebar, cAyi, text = "3M dönüş", textcolor = cAyi, size = size.small)
+plotshape(m4 and i_3m and uc3Yukari, "3M dönüş (yukarı)", shape.xcross, location.belowbar, cBoga, text = "3M dönüş", textcolor = cBoga, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MODÜL 5 · KURULUM SİNYALİ
+// ════════════════════════════════════════════════════════════════════════════
+var array<line>  kCizgi  = array.new<line>()
+var array<label> kEtiket = array.new<label>()
+
+// Giriş / stop / hedefi çizer. Geçerliyse true, "R:R yetersiz" ise false döner.
+f_kurulum(int yon) =>
+    float adim  = syminfo.mintick * i_kademe
+    float giris = yon == 1 ? high + adim : low - adim          // buy-stop / sell-stop
+    float stop  = yon == 1 ? low : high
+    if i_stopMod == "Son pivot"
+        stop := yon == 1 ? math.min(low, nz(sonL, low)) : math.max(high, nz(sonH, high))
+    if i_atrPay
+        stop := stop - yon * atr14 * i_atrKat
+    float risk    = math.abs(giris - stop)
+    float hedef   = giris + yon * risk * i_rr
+    bool  cekildi = false
+    // Giriş ile hedef arasında karşı zon varsa hedef o zonun hemen önüne çekilir
+    int n = array.size(zSev)
+    if n > 0
+        float engel = na
+        for i = 0 to n - 1
+            if array.get(zSay, i) >= i_zMin
+                float zb = array.get(zAlt, i)
+                float zt = array.get(zUst, i)
+                if yon == 1 and zb > giris and zb < hedef
+                    engel := na(engel) ? zb : math.min(engel, zb)
+                else if yon == -1 and zt < giris and zt > hedef
+                    engel := na(engel) ? zt : math.max(engel, zt)
+        if not na(engel)
+            hedef   := engel - yon * adim
+            cekildi := true
+    float rrG      = risk > 0 ? (hedef - giris) * yon / risk : 0.0
+    bool  yetersiz = cekildi and rrG < i_minRR
+    color cG = yetersiz ? cNotr : color.blue
+    color cS = yetersiz ? cNotr : cAyi
+    color cH = yetersiz ? cNotr : cBoga
+    int   x2 = bar_index + 12
+    array.push(kCizgi, line.new(bar_index, giris, x2, giris, color = cG, width = 2))
+    array.push(kCizgi, line.new(bar_index, stop, x2, stop, color = cS, style = line.style_dashed))
+    array.push(kCizgi, line.new(bar_index, hedef, x2, hedef, color = cH, style = line.style_dashed))
+    string yazi = (yon == 1 ? "LONG" : "SHORT") + (yetersiz ? " · R:R yetersiz" : "") +
+         "\nGiriş: " + str.tostring(giris, format.mintick) +
+         "\nStop: " + str.tostring(stop, format.mintick) +
+         "\nHedef: " + str.tostring(hedef, format.mintick) +
+         "\nR:R 1:" + str.tostring(rrG, "#.##") + (cekildi ? " (zon önüne çekildi)" : "")
+    array.push(kEtiket, label.new(bar_index, yon == 1 ? low : high, yazi,
+         yloc = yon == 1 ? yloc.belowbar : yloc.abovebar,
+         style = yon == 1 ? label.style_label_up : label.style_label_down,
+         color = yetersiz ? color.new(cNotr, 20) : color.new(yon == 1 ? cBoga : cAyi, 10),
+         textcolor = color.white, size = size.small))
+    while array.size(kEtiket) > i_maxKur
+        label.delete(array.shift(kEtiket))
+    while array.size(kCizgi) > i_maxKur * 3
+        line.delete(array.shift(kCizgi))
+    not yetersiz
+
+// Geri çekilme bölgesi: sinyal mumu veya bir önceki mum
+loAlan = math.min(low, low[1])
+hiAlan = math.max(high, high[1])
+f_emaGeriL(float E) =>
+    not na(E) and loAlan <= E + tolAnlik and close > E
+f_emaGeriS(float E) =>
+    not na(E) and hiAlan >= E - tolAnlik and close < E
+zIdL = f_zonBul(1, loAlan, high)
+zIdS = f_zonBul(-1, low, hiAlan)
+emaL = (emaMod != 0 and (f_emaGeriL(e1) or f_emaGeriL(e2) or f_emaGeriL(e3))) or f_emaGeriL(algoDeger)
+emaS = (emaMod != 0 and (f_emaGeriS(e1) or f_emaGeriS(e2) or f_emaGeriS(e3))) or f_emaGeriS(algoDeger)
+
+longHam  = i_m5 and cf and trend == 1 and htfTrend == 1 and (zIdL != -1 or emaL) and (bogaYutan or bogaPin) and saatFiltre != -1 and not swingEngelL
+shortHam = i_m5 and cf and trend == -1 and htfTrend == -1 and (zIdS != -1 or emaS) and (ayiYutan or ayiPin) and saatFiltre != 1 and not swingEngelS
+
+// Garantici mod: aynı bölgedeki (aynı zon ya da EMA) ilk sinyal atlanır
+var int gSayL = 0
+var int gKeyL = -99
+var int gBarL = na
+var int gSayS = 0
+var int gKeyS = -99
+var int gBarS = na
+bool longAlarm  = false
+bool shortAlarm = false
+bool longAtla   = false
+bool shortAtla  = false
+
+if longHam
+    int key = zIdL != -1 ? zIdL : -1
+    gSayL := key == gKeyL and not na(gBarL) and bar_index - gBarL <= i_gPencere ? gSayL + 1 : 1
+    gKeyL := key
+    gBarL := bar_index
+    if not i_garantici or gSayL >= 2
+        longAlarm := f_kurulum(1)
+    else
+        longAtla := true
+
+if shortHam
+    int key = zIdS != -1 ? zIdS : -1
+    gSayS := key == gKeyS and not na(gBarS) and bar_index - gBarS <= i_gPencere ? gSayS + 1 : 1
+    gKeyS := key
+    gBarS := bar_index
+    if not i_garantici or gSayS >= 2
+        shortAlarm := f_kurulum(-1)
+    else
+        shortAtla := true
+
+plotshape(longAtla, "Garantici: atlanan LONG", shape.circle, location.belowbar, cNotr, text = "1.", textcolor = cNotr, size = size.tiny)
+plotshape(shortAtla, "Garantici: atlanan SHORT", shape.circle, location.abovebar, cNotr, text = "1.", textcolor = cNotr, size = size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TABLO
+// ════════════════════════════════════════════════════════════════════════════
+f_trendYazi(int t) =>
+    t == 1 ? "Yükseliş" : t == -1 ? "Düşüş" : "Yatay"
+f_trendRenk(int t) =>
+    t == 1 ? cBoga : t == -1 ? cAyi : cNotr
+
+tabloPoz = i_tabloPoz == "Sağ üst" ? position.top_right : i_tabloPoz == "Sağ alt" ? position.bottom_right : i_tabloPoz == "Sol üst" ? position.top_left : position.bottom_left
+var table tbl = table.new(tabloPoz, 2, 6, bgcolor = color.new(color.black, 20), border_color = color.new(color.gray, 60), border_width = 1)
+
+if barstate.islast and i_tablo
+    string emaYazi = emaMod == 1 ? "Scalp 7/13/26" : emaMod == 2 ? "Gün içi 7/14/21" : emaMod == 3 ? "Swing 20/50/200" : "Kapalı"
+    string filtreYazi = emaMod != 1 or not i_saatFiltre ? "-" : saatFiltre == 1 ? "Sadece LONG" : saatFiltre == -1 ? "Sadece SHORT" : "Filtre yok"
+    string algoYazi = not i_algo ? "Kapalı" : algoIdx >= 0 ? "EMA " + str.tostring(array.get(algoLen, algoIdx)) : algoDurum == 2 ? "Uygun aday yok" : "Bekleniyor"
+    table.cell(tbl, 0, 0, "Trend (" + timeframe.period + ")", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, f_trendYazi(trend), text_color = color.white, bgcolor = color.new(f_trendRenk(trend), 30), text_size = size.small)
+    table.cell(tbl, 0, 1, "Üst ZD (" + f_zdAd(ustZd) + ")", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 1, f_trendYazi(htfTrend), text_color = color.white, bgcolor = color.new(f_trendRenk(htfTrend), 30), text_size = size.small)
+    table.cell(tbl, 0, 2, "Durum", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 2, uyumlu ? "Uyumlu" : "Çelişkili, işlem riskli", text_color = color.white, bgcolor = color.new(uyumlu ? cBoga : color.orange, 30), text_size = size.small)
+    table.cell(tbl, 0, 3, "EMA seti", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 3, emaYazi, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 4, "1s filtre", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 4, filtreYazi, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 5, "Algo EMA", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 5, algoYazi, text_color = color.white, bgcolor = color.new(cAlgo, 50), text_size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ALARMLAR
+// ════════════════════════════════════════════════════════════════════════════
+alertcondition(longAlarm, "LONG kurulumu", "Sidar PA: LONG kurulumu – {{ticker}} {{interval}} kapanış {{close}}")
+alertcondition(shortAlarm, "SHORT kurulumu", "Sidar PA: SHORT kurulumu – {{ticker}} {{interval}} kapanış {{close}}")
+alertcondition(longAlarm or shortAlarm, "Herhangi bir kurulum", "Sidar PA: yeni kurulum – {{ticker}} {{interval}}")
+alertcondition(yapiYukari, "Yapı değişimi: Yükseliş", "Sidar PA: yapı yükselişe döndü – {{ticker}} {{interval}}")
+alertcondition(yapiAsagi, "Yapı değişimi: Düşüş", "Sidar PA: yapı düşüşe döndü – {{ticker}} {{interval}}")
+alertcondition(donusL or donusS, "Gün içi trend dönüşü", "Sidar PA: gün içi trend dönüşü – {{ticker}} {{interval}}")
+alertcondition(rolDegisti, "Zon rol değişimi", "Sidar PA: bir zon rol değiştirdi – {{ticker}} {{interval}}")
