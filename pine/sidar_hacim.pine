@@ -9,9 +9,10 @@
 //  • Pivotlar "sağ bar" sayısı kadar gecikmeyle onaylanır; dalga ve seviye
 //    etiketleri bu yüzden birkaç mum geç gelir.
 //  • request.security_lower_tf ileriye bakmaz (lookahead parametresi yoktur).
+//  • Ana grafiğe etiket basılmaz; zon kırılımlarının hacmi "Sidar PA Asistanı"nda (H+ / H−) gösterilir.
 // ════════════════════════════════════════════════════════════════════════════
 indicator("Sidar Hacim", shorttitle = "Sidar Hacim", overlay = false, format = format.volume,
-     max_labels_count = 150, max_boxes_count = 50, max_bars_back = 500)
+     max_labels_count = 40, max_boxes_count = 50, max_bars_back = 500)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  AYARLAR
@@ -33,6 +34,7 @@ i_sahte  = input.bool(false, "'Sahte satış? / sahte alış?' noktaları", grou
 
 G3 = "3 · Kuruyan hacim ve kırılım"
 i_b3      = input.bool(true, "Bölüm 3'ü aç", group = G3)
+i_kirBekle = input.int(10, "Aynı yönde iki kırılım işareti arası en az (bar)", minval = 1, group = G3)
 i_svMes   = input.float(0.5, "Seviye kümeleme mesafesi (× ATR14)", minval = 0.1, step = 0.1, group = G3)
 i_svMin   = input.int(2, "Seviye için minimum pivot", minval = 2, maxval = 10, group = G3)
 i_kuruN   = input.int(6, "Kuruyan hacim: bakılacak mum", minval = 5, maxval = 10, group = G3)
@@ -57,14 +59,12 @@ i_altOto   = input.bool(true, "Alt zaman dilimi otomatik (≈ grafik / 5)", grou
 i_altZd    = input.timeframe("1", "Alt zaman dilimi (otomatik kapalıyken)", group = G6)
 i_deltaYer = input.string("Panelde seri", "Delta gösterimi", options = ["Panelde seri", "Tabloda"], group = G6)
 
-G7 = "7 · Ana grafik"
-i_ana = input.bool(true, "Ana grafikte göster (kırılım ve tükeniş)", group = G7)
 
 // ─── Renkler ────────────────────────────────────────────────────────────────
 color cAcikGri     = #b2b5be
 color cKoyuGri     = #5d606b
-color cAcikYesil   = #81c784
-color cKoyuYesil   = #1b8a3c
+color cAcikYesil   = #a5d6a7
+color cKoyuYesil   = #2e7d32
 color cAcikKirmizi = #ef9a9a
 color cKoyuKirmizi = #c62828
 color cOrt         = #ff9800
@@ -90,25 +90,16 @@ if not na(volume) and volume > 0
 
 // Etiket sınırı kod içinde uygulanır
 var array<label> panelEt = array.new<label>()
-var array<label> anaEt   = array.new<label>()
 f_sakla(array<label> dizi, label lb, int limit) =>
     array.push(dizi, lb)
     while array.size(dizi) > limit
         label.delete(array.shift(dizi))
     true
 
-// Panelde, hacim çubuğunun üstüne küçük etiket
-f_panel(string yazi, color renk) =>
+// Panelde, hacim çubuğunun üstüne kısa etiket; tam açıklama tooltip'te. En fazla 20 etiket.
+f_panel(string yazi, string aciklama, color renk) =>
     f_sakla(panelEt, label.new(bar_index, vol, yazi, yloc = yloc.price, style = label.style_label_down,
-         color = color.new(renk, 15), textcolor = color.white, size = size.tiny), 80)
-
-// Ana grafikte, mumun üstüne/altına küçük etiket (force_overlay)
-f_ana(string yazi, color renk, bool ustte) =>
-    if i_ana
-        f_sakla(anaEt, label.new(bar_index, ustte ? high + 0.3 * atr14 : low - 0.3 * atr14, yazi, yloc = yloc.price,
-             style = ustte ? label.style_label_down : label.style_label_up,
-             color = color.new(renk, 20), textcolor = color.white, size = size.tiny, force_overlay = true), 30)
-    true
+         color = color.new(renk, 15), textcolor = color.white, size = size.tiny, tooltip = aciklama), 20)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  BÖLÜM 1 · HACİM ÇUBUKLARI VE RVOL
@@ -117,7 +108,8 @@ color hacimRenk = na(rvol) or rvol < i_e1 ? (yukselisMumu ? cAcikGri : cKoyuGri)
      rvol < i_e2 ? (yukselisMumu ? cAcikYesil : cAcikKirmizi) : (yukselisMumu ? cKoyuYesil : cKoyuKirmizi)
 
 plot(i_b1 ? volume : na, "Hacim", color = hacimRenk, style = plot.style_columns)
-plot(i_b1 and i_ortCiz ? ortHacim : na, "Ortalama hacim", color = cOrt, linewidth = 1)
+// Çizgi = RVOL paydası (önceki N mum ortalaması); çubuk bu çizginin 1,5 / 2 katını geçince renk değişir
+plot(i_b1 and i_ortCiz ? ortOnce : na, "Ortalama hacim", color = cOrt, linewidth = 1)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  BÖLÜM 2 · PİVOTLAR VE DALGA HACMİ
@@ -202,9 +194,10 @@ if cf
                     while array.size(dalgaKutu) > 40
                         box.delete(array.shift(dalgaKutu))
                     sonKutuBas := dalgaBas
-                    sonKutuEt  := label.new(pBar, mx, saglikli ? "Sağlıklı" : "Karşı taraf güçlü", yloc = yloc.price,
-                         style = label.style_label_down, color = color.new(ton, 20), textcolor = color.white, size = size.tiny)
-                    f_sakla(panelEt, sonKutuEt, 80)
+                    sonKutuEt  := label.new(pBar, mx, saglikli ? "S✓" : "K!", yloc = yloc.price,
+                         style = label.style_label_down, color = color.new(ton, 20), textcolor = color.white, size = size.tiny,
+                         tooltip = saglikli ? "Sağlıklı: geri çekilme hacmi itiş dalgasından düşük" : "Karşı taraf güçlü: geri çekilme hacmi itiş dalgasından yüksek")
+                    f_sakla(panelEt, sonKutuEt, 20)
 
 // Opsiyonel: sahte satış / sahte alış noktaları
 sahteSatis = i_b2 and i_sahte and cf and trend == 1 and dususMumu and vol < ortOnce
@@ -255,22 +248,13 @@ if cf and i_b3
                     array.remove(svSon, eski)
                     array.remove(svKir, eski)
 
-// En yakın seviyeye mesafe ve kapanışla kırılım
+// En yakın kümelenmiş seviyeye mesafe (yalnızca "kuruyan hacim" için)
 float yakinMes = na
-int   kirYon   = 0
 if i_b3 and array.size(svFiyat) > 0
     for i = 0 to array.size(svFiyat) - 1
         if array.get(svSay, i) >= i_svMin
-            float s = array.get(svFiyat, i)
-            float d = math.abs(close - s)
+            float d = math.abs(close - array.get(svFiyat, i))
             yakinMes := na(yakinMes) ? d : math.min(yakinMes, d)
-            if cf and bar_index - array.get(svKir, i) > 3
-                if close > s and close[1] <= s
-                    kirYon := 1
-                    array.set(svKir, i, bar_index)
-                else if close < s and close[1] >= s
-                    kirYon := -1
-                    array.set(svKir, i, bar_index)
 
 // Kuruyan hacim: seviyeye yaklaşırken kısa hacim ortalaması düşüyor
 kOrt   = ta.sma(vol, 3)
@@ -278,18 +262,30 @@ yariN  = int(math.floor(i_kuruN / 2))
 yaklasiyor    = not na(yakinMes) and yakinMes <= i_yakin * atr14 and yakinMes < nz(yakinMes[i_kuruN], 1e20)
 hacimAzaliyor = kOrt < kOrt[yariN] and kOrt[yariN] < kOrt[i_kuruN] and kOrt < ortOnce
 kuruyan = i_b3 and cf and yaklasiyor and hacimAzaliyor
-plotshape(kuruyan and not kuruyan[1], "Kuruyan hacim (başlangıç)", shape.triangleup, location.bottom, cBilgi, text = "Kuruyan hacim", textcolor = cBilgi, size = size.tiny)
-plotshape(kuruyan, "Kuruyan hacim", shape.circle, location.bottom, color.new(cBilgi, 40), size = size.tiny)
+// Panelin altında ince, mor, yarı saydam şerit (yazı yok)
+plotshape(kuruyan, "Kuruyan hacim", shape.square, location.bottom, color.new(cBilgi, 50), size = size.tiny)
 
-// Kırılım hacmi
-bool hacimliKir  = cf and kirYon != 0 and rvol >= 2
-bool hacimsizKir = cf and kirYon != 0 and rvol < 1
-if hacimliKir
-    f_panel("Hacimli kırılım", kirYon == 1 ? cKoyuYesil : cKoyuKirmizi)
-    f_ana("Hacimli kırılım", kirYon == 1 ? cKoyuYesil : cKoyuKirmizi, true)
-if hacimsizKir
-    f_panel("Hacimsiz kırılım, tuzak riski", color.orange)
-    f_ana("Hacimsiz kırılım, tuzak riski", color.orange, true)
+// Kırılım: yalnızca son pivot tepe / dibin (piyasa yapısı seviyesi) KAPANIŞLA kırılması
+var int sonKirL = na
+var int sonKirS = na
+kirYukari = not na(sonH) and close > sonH and close[1] <= sonH
+kirAsagi  = not na(sonL) and close < sonL and close[1] >= sonL
+bekleL = not na(sonKirL) and bar_index - sonKirL < i_kirBekle
+bekleS = not na(sonKirS) and bar_index - sonKirS < i_kirBekle
+bool kirHacimliYuk  = i_b3 and cf and kirYukari and not bekleL and rvol >= 2
+bool kirHacimsizYuk = i_b3 and cf and kirYukari and not bekleL and rvol < 1
+bool kirHacimliAsg  = i_b3 and cf and kirAsagi and not bekleS and rvol >= 2
+bool kirHacimsizAsg = i_b3 and cf and kirAsagi and not bekleS and rvol < 1
+if kirHacimliYuk or kirHacimsizYuk
+    sonKirL := bar_index
+if kirHacimliAsg or kirHacimsizAsg
+    sonKirS := bar_index
+bool hacimliKir  = kirHacimliYuk or kirHacimliAsg
+bool hacimsizKir = kirHacimsizYuk or kirHacimsizAsg
+plotshape(kirHacimliYuk ? vol : na, "Hacimli kırılım (yukarı)", shape.triangleup, location.absolute, cKoyuYesil, text = "K+", textcolor = cKoyuYesil, size = size.tiny)
+plotshape(kirHacimliAsg ? vol : na, "Hacimli kırılım (aşağı)", shape.triangledown, location.absolute, cKoyuYesil, text = "K+", textcolor = cKoyuYesil, size = size.tiny)
+plotshape(kirHacimsizYuk ? vol : na, "Hacimsiz kırılım (yukarı)", shape.triangleup, location.absolute, color.orange, text = "K−", textcolor = color.orange, size = size.tiny)
+plotshape(kirHacimsizAsg ? vol : na, "Hacimsiz kırılım (aşağı)", shape.triangledown, location.absolute, color.orange, text = "K−", textcolor = color.orange, size = size.tiny)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  BÖLÜM 4 · TÜKENİŞ (bilgi etiketi, giriş sinyali değil)
@@ -307,12 +303,11 @@ saticiTukendi = i_b4 and cf and devSatis and yutarYukari and benzer
 aliciTukendi  = i_b4 and cf and devAlis and yutarAsagi and benzer
 
 if tukenis
-    f_panel("Tükeniş?", color.purple)
-    f_ana("Tükeniş?", color.purple, true)
+    f_panel("T?", "Tükeniş? Trendin tersine dev gövdeli ve yüksek hacimli mum. Bilgi etiketidir; kurala göre hemen girilmez, ilk geri çekilme beklenir.", color.purple)
 if saticiTukendi
-    f_panel("Satıcı tükendi", cKoyuYesil)
+    f_panel("ST", "Satıcı tükendi: dev hacimli satış mumu benzer boy ve hacimde alıcı mumla yutuldu", cKoyuYesil)
 if aliciTukendi
-    f_panel("Alıcı tükendi", cKoyuKirmizi)
+    f_panel("AT", "Alıcı tükendi: dev hacimli alış mumu benzer boy ve hacimde satıcı mumla yutuldu", cKoyuKirmizi)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  BÖLÜM 5 · SESSİZLİK SONRASI İLK HACİM
@@ -333,9 +328,9 @@ if cf and i_b5
     if vol > 0 and vol <= sessizEsik
         sonSessiz := bar_index
 if sessizAlici
-    f_panel("Sessizlik sonrası alıcı", cKoyuYesil)
+    f_panel("SS↑", "Sessizlik sonrası alıcı: düşük hacimli bölgeden sonra trend yönünde ilk hacimli mum", cKoyuYesil)
 if sessizSatici
-    f_panel("Sessizlik sonrası satıcı", cKoyuKirmizi)
+    f_panel("SS↓", "Sessizlik sonrası satıcı: düşük hacimli bölgeden sonra trend yönünde ilk hacimli mum", cKoyuKirmizi)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  BÖLÜM 6 · MUM İÇİ ALIŞ/SATIŞ TAHMİNİ (gerçek order flow değildir)
