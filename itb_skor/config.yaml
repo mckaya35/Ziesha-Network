@@ -1,0 +1,39 @@
+# ITB Skor — tüm parametreler burada. Test sonucuna bakarak DEĞİŞTİRME.
+symbols: [BTCUSDT, ETHUSDT]
+interval: 1h
+start: "2020-01-01"
+data_dir: data
+out_dir: out
+
+features:
+  windows: [6, 24, 72, 168]
+  hour: true            # hour_sin / hour_cos (UTC, bar açılış saati)
+
+label:
+  H: 24                 # bar
+  up: 0.02              # TP / hedef  (%2)
+  adverse: 0.01         # SL / ters   (%1)  -> 1R
+
+walkforward:
+  train_months: 12
+  test_months: 1
+  first_test: "2021-01"
+  val_frac: 0.20        # eğitim içi son %20 = eşik seçimi için doğrulama
+  C: 1.0                # LogisticRegression C
+  thresholds: [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+  min_val_trades: 10    # doğrulamada bu kadar işlem yoksa eşik "işlem yok" kabul edilir
+
+costs:
+  fee: 0.0005           # taker, taraf başına
+  slippage: 0.0002      # taraf başına
+  # funding gerçek oranlarla (data/<SYM>_funding.parquet)
+
+benchmark:
+  random_reps: 1000
+  seed: 42
+
+criteria:
+  min_trades: 300
+  random_pct: 95        # modelin ort. R'si rastgele dağılımın bu yüzdeliğinden büyük olmalı
+  year_frac: 0.6667     # pozitif yıl oranı (3 yılın 2'si)
+  cost_mult: 2.0        # maliyet bu katsayıyla çarpılınca ort. R >= 0

@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+data_synth/
+out_synth/
+out/*.parquet
+out/*.csv
