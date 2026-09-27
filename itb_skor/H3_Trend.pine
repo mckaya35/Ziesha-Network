@@ -1,0 +1,52 @@
+//@version=6
+// H3 — Günlük trend takibi (klasik Turtle Sistem 1 kuralları). Ön kayıt: itb_skor/HYPOTHESIS_H3.md
+// Python karşılığı: itb_skor/h3_trend.py (aynı kurallar, gerçek funding dahil).
+// Sabitler bilerek input() DEĞİL: TradingView'da parametre optimizasyonu (aşırı uydurma) yapılmasın.
+// Komisyon %0,07/taraf = %0,05 komisyon + %0,02 kayma. Funding MODELLENMEZ -> sonuç Python testinden iyimserdir.
+// Bu script emir göndermez. Kanıtlanmış bir avantaj iddiası yoktur; yatırım tavsiyesi değildir.
+strategy("H3 Trend (Turtle-1, ön kayıtlı)", overlay = true, initial_capital = 10000, currency = currency.USD, commission_type = strategy.commission.percent, commission_value = 0.07, pyramiding = 0, process_orders_on_close = false, calc_on_every_tick = false, margin_long = 100, margin_short = 100)
+
+// ---- Ön kayıt sabitleri (DEĞİŞTİRME; değişiklik = yeni hipotez) ----
+ENTRY_N  = 20      // giriş kanalı (gün)
+EXIT_N   = 10      // çıkış kanalı (gün)
+ATR_N    = 20      // N = ta.atr(20)
+STOP_ATR = 2.0     // stop = sinyal kapanışı ∓ 2N
+RISK     = 0.01    // işlem başına sermaye riski (tek grafik için; Python portföyü %0,5 kullanır)
+
+tf_ok = timeframe.isdaily and timeframe.multiplier == 1
+
+n      = ta.atr(ATR_N)
+hh_in  = ta.highest(high, ENTRY_N)[1]     // önceki 20 gün (bugün hariç)
+ll_in  = ta.lowest(low, ENTRY_N)[1]
+hh_out = ta.highest(high, EXIT_N)[1]      // önceki 10 gün
+ll_out = ta.lowest(low, EXIT_N)[1]
+
+var float stop_px = na
+
+// ---- Kanal çıkışı: kapanışta sinyal, ertesi açılışta piyasa emri ----
+if strategy.position_size > 0 and close < ll_out
+    strategy.close("L", comment = "kanal")
+if strategy.position_size < 0 and close > hh_out
+    strategy.close("S", comment = "kanal")
+
+// ---- Giriş: yalnızca düzken; stop emri girişle birlikte verilir (bar içi, giriş günü dahil) ----
+if tf_ok and strategy.position_size == 0 and not na(n) and not na(hh_in)
+    qty = math.min(RISK * strategy.equity / (STOP_ATR * n), strategy.equity / close)
+    if close > hh_in
+        stop_px := close - STOP_ATR * n
+        strategy.entry("L", strategy.long, qty = qty)
+        strategy.exit("L-SL", "L", stop = stop_px, comment = "stop")
+    else if close < ll_in
+        stop_px := close + STOP_ATR * n
+        strategy.entry("S", strategy.short, qty = qty)
+        strategy.exit("S-SL", "S", stop = stop_px, comment = "stop")
+
+// ---- Çizimler ----
+plot(hh_in, "20g üst kanal", color = color.new(color.green, 60))
+plot(ll_in, "20g alt kanal", color = color.new(color.red, 60))
+plot(strategy.position_size != 0 ? stop_px : na, "Stop", color = color.orange, style = plot.style_linebr, linewidth = 2)
+
+var table tb = table.new(position.top_right, 1, 2, bgcolor = color.new(color.black, 20))
+if barstate.islast
+    table.cell(tb, 0, 0, tf_ok ? "H3 Turtle-1 · günlük" : "UYUMSUZ: yalnızca 1D grafikte işlem açar", text_color = tf_ok ? color.white : color.red)
+    table.cell(tb, 0, 1, "Ön kayıtlı · funding hariç · avantaj kanıtlanmadı", text_color = color.yellow)

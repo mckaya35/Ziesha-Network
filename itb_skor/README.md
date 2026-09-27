@@ -81,6 +81,14 @@ python h2_momentum.py --forward    # C: kayıtlı sinyallerin gerçekleşen sonu
 ```
 C için her pazartesi `forward/h2_signals.csv` git'e commit'lenmelidir (commit zamanı = sinyalin önceden kaydedildiğinin kanıtı).
 
+## H3 — günlük trend takibi, Turtle Sistem 1 (ön kayıtlı: `HYPOTHESIS_H3.md`)
+Klasik kurallar (20g kırılım, 10g çıkış, 2·ATR(20) stop), bu veride optimize edilmedi. 20 coin, 4h veriden günlük mum.
+```bash
+python h3_trend.py             # A: tarihsel test -> out/h3/report.md
+python h3_trend.py --forward   # C: 2026-10-05 sonrası işlemler
+```
+`H3_Trend.pine`: aynı kuralların Pine v6 `strategy` karşılığı (sabitler gömülü, funding hariç).
+
 ## Sınırlar
 - Pine dosyası otomatik üretilir; TradingView derleyicisinde denenmesi ve `parity_check.csv` ile doğrulanması gerekir.
 - Geçmiş test gelecekteki performansı garanti etmez. Yatırım tavsiyesi değildir.
