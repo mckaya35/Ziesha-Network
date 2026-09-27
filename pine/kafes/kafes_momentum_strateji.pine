@@ -33,7 +33,6 @@ darEsik      = input.float(0.5, "Çok dar eşiği (× ATR14)", minval=0.1, step=
 genisEsik    = input.float(4.0, "Çok geniş eşiği (× ATR14)", minval=0.5, step=0.5, group=G_KAFES)
 
 // ── Modül 3: Bias ──
-vwapFiltre      = input.bool(true, "VWAP yön filtresi", group=G_BIAS, tooltip="LONG: kapanış > VWAP, SHORT: kapanış < VWAP. VWAP kafes penceresinin başından çapalıdır.")
 gunKatsayi      = input.float(1.5, "Güçlü gün eşiği (× ADR20)", minval=1.0, step=0.1, group=G_BIAS, tooltip="Son 2 tamamlanmış günün ikisi de bu eşikten büyükse 'Dengeli gün beklentisi'.")
 gunTipiMod      = input.string("Uyar", "Dengeli gün beklentisinde", options=["Uyar", "Sinyali gizle", "Riski yarıya indir"], group=G_BIAS)
 haftaSonuFiltre = input.bool(true, "Cumartesi–Pazar sinyal yok (UTC)", group=G_BIAS)
@@ -54,6 +53,8 @@ bekleme      = input.int(5, "Aynı yönde bekleme (bar)", minval=0, maxval=50, g
 ekPayAcik    = input.bool(false, "Stopa ek pay ekle", inline="pay", group=G_GIRIS)
 ekPay        = input.float(0.1, "× ATR", minval=0.0, step=0.05, inline="pay", group=G_GIRIS)
 minRiskAtr   = input.float(0.3, "Min. stop mesafesi (× ATR)", minval=0.05, step=0.05, group=G_GIRIS)
+minStopYuzde = input.float(0.35, "Min. stop mesafesi (% fiyat)", minval=0.0, step=0.05, group=G_GIRIS, tooltip="Min. stop = max(ATR × katsayı, fiyat × bu yüzde).")
+maxMaliyet   = input.float(15.0, "Maks. maliyet / stop mesafesi (%)", minval=1.0, maxval=100.0, step=1.0, group=G_GIRIS, tooltip="Gidiş-dönüş maliyeti (2 × komisyon% × fiyat + 2 × kayma tick) stop mesafesinin bu yüzdesini aşarsa işleme girilmez.")
 hedefMod     = input.string("Takip", "Hedef", options=["Takip", "Sabit R"], group=G_GIRIS)
 hedefR       = input.float(3.0, "Sabit hedef (R)", minval=0.5, step=0.5, group=G_GIRIS)
 
@@ -80,12 +81,13 @@ float tick    = syminfo.mintick
 // YARDIMCI FONKSİYONLAR
 // ════════════════════════════════════════════════════════════════════════════
 // Stop hesabı: ham stop + opsiyonel pay; min. risk altına düşerse genişletilir.
-stopHesapla(int yon, float giris, float hamStop, float atrD, bool payAcik, float payAtr, float minAtr) =>
+stopHesapla(int yon, float giris, float hamStop, float atrD, bool payAcik, float payAtr, float minAtr, float minYuzde) =>
     float s = hamStop - yon * (payAcik ? payAtr * atrD : 0.0)
     float r = yon * (giris - s)
-    if r < minAtr * atrD
-        s := giris - yon * minAtr * atrD
-        r := minAtr * atrD
+    float minMesafe = math.max(minAtr * atrD, minYuzde / 100 * giris)
+    if r < minMesafe
+        s := giris - yon * minMesafe
+        r := minMesafe
     [s, r]
 
 // Engel kontrolü: giriş ile 1R arasında önemli seviye varsa neden döner, yoksa "".
@@ -212,6 +214,10 @@ var float islemHedef = na
 var float islemCarpan = 1.0
 var int islemGirisBar = na
 var bool riskSifir = false
+var float islemMFE = na
+var int rfSayi = 0
+var int rfIhlal = 0
+var float rfEnKotu = na
 var int islemNo = 0
 var int sonKapanisL = na
 var int sonKapanisS = na
@@ -322,6 +328,7 @@ if barstate.isconfirmed
             islemCarpan := emirCarpan
             islemGirisBar := bar_index
             riskSifir := false
+            islemMFE := emirYon == 1 ? high : low
             islemNo += 1
             emirVar := false
             girisBari := true
@@ -330,6 +337,16 @@ if barstate.isconfirmed
             // GEÇİŞ: emir süresi doldu → iptal
             emirVar := false
             sonIptal := (emirModel == 1 ? "Momentum" : "Reload") + " emri tetiklenmedi"
+
+    // ── Bias (zorunlu): bekleyen emir her kapanışta yeniden doğrulanır ──
+    // Emir, bir sonraki barda yalnızca son kapanışta bias uyuyorsa tetiklenebilir.
+    // (Dolum barının kendi kapanışı dolumdan SONRA bilinir; onu kullanmak geleceği görmek olur.)
+    if emirVar and not islemVar and bar_index > emirBar
+        bool biasTutuyor = emirYon == 1 ? not na(vwapD) and close > vwapD : not na(vwapD) and close < vwapD
+        if not biasTutuyor
+            // GEÇİŞ: emir → iptal
+            emirVar := false
+            sonIptal := "Bias ters"
 
     // ── MODÜL 6/8: Bar içi çıkış (stop önce – kötümser) ──
     bool kapanis = false
@@ -395,6 +412,12 @@ if barstate.isconfirmed
         while array.size(sonuclar) > istN
             array.shift(sonuclar)
             array.shift(modeller)
+        // Risksiz doğrulama: stop girişe çekildiyse brüt R ≥ +1 tick olmalı (net ≥ −maliyet)
+        if riskSifir
+            rfSayi += 1
+            rfEnKotu := na(rfEnKotu) ? netR : math.min(rfEnKotu, netR)
+            if brutR < 0
+                rfIhlal += 1
         // Günlük sayaçlar (kayıp = fiyat bazında zarar; başa baş sayılmaz)
         gunR += netR
         if brutR < 0
@@ -417,11 +440,16 @@ if barstate.isconfirmed
     if islemVar
         float eskiStop = islemStop
         bool sifirOnce = riskSifir
+        islemMFE := islemYon == 1 ? math.max(islemMFE, high) : math.min(islemMFE, low)
         if not riskSifir
-            bool ulasti = islemYon == 1 ? high >= islemGiris + riskSifirR * islemRisk : low <= islemGiris - riskSifirR * islemRisk
-            if ulasti
+            float beStop = islemGiris + islemYon * tick
+            bool ulasti = islemYon == 1 ? islemMFE >= islemGiris + riskSifirR * islemRisk : islemMFE <= islemGiris - riskSifirR * islemRisk
+            // BE stopu yalnızca kapanış stopun lehe tarafındaysa kurulur; aksi halde
+            // stop piyasanın yanlış tarafında kalır ve sonraki açılışta zararla dolar.
+            // Eşiğe ulaşılmış ama kapanış geride kalmışsa, ilk uygun kapanışta kurulur.
+            bool uygun = islemYon == 1 ? close > beStop : close < beStop
+            if ulasti and uygun
                 // GEÇİŞ: Risk → Risksiz (stop giriş + 1 tick)
-                float beStop = islemGiris + islemYon * tick
                 islemStop := islemYon == 1 ? math.max(islemStop, beStop) : math.min(islemStop, beStop)
                 riskSifir := true
                 evRiskSifir := true
@@ -433,8 +461,9 @@ if barstate.isconfirmed
                 islemStop := math.min(islemStop, high + tick)
     // ── Sinyal izin kontrolleri ──
     string genelEngel = gunlukLimit ? "Günlük limit doldu" : haftaSonuFiltre and haftaSonu ? "Hafta sonu" : dengeliGun and gunTipiMod == "Sinyali gizle" ? "Dengeli gün beklentisi" : ""
-    bool vwapLongOk = not vwapFiltre or na(vwapD) or close > vwapD
-    bool vwapShortOk = not vwapFiltre or na(vwapD) or close < vwapD
+    // Bias (zorunlu): LONG close > seans VWAP, SHORT close < seans VWAP. VWAP yoksa izin yok.
+    bool vwapLongOk = not na(vwapD) and close > vwapD
+    bool vwapShortOk = not na(vwapD) and close < vwapD
     bool bekLongOk = na(sonKapanisL) or bar_index - sonKapanisL >= bekleme
     bool bekShortOk = na(sonKapanisS) or bar_index - sonKapanisS >= bekleme
     float carpanYeni = dengeliGun and gunTipiMod == "Riski yarıya indir" ? 0.5 : 1.0
@@ -456,8 +485,8 @@ if barstate.isconfirmed
             // ── MODÜL 5A: Momentum emri (kabul mumundan sonra stop emri) ──
             if girisModeli != "Reload"
                 float gM = setupYon == 1 ? kabulH + tick : kabulL - tick
-                [sM, rM] = stopHesapla(setupYon, gM, setupYon == 1 ? kabulL : kabulH, atr, ekPayAcik, ekPay, minRiskAtr)
-                string nedenM = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "VWAP ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : engelKontrol(setupYon, gM, rM, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
+                [sM, rM] = stopHesapla(setupYon, gM, setupYon == 1 ? kabulL : kabulH, atr, ekPayAcik, ekPay, minRiskAtr, minStopYuzde)
+                string nedenM = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "Bias ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : 2 * komisyon / 100 * gM + 2 * kaymaTick * tick > maxMaliyet / 100 * rM ? "Stop maliyete göre dar" : engelKontrol(setupYon, gM, rM, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
                 if nedenM == ""
                     emirVar := true
                     emirYon := setupYon
@@ -491,8 +520,8 @@ if barstate.isconfirmed
                 if tetik
                     bool guclu = hacimVar and rvol >= rvolEsik and mumBoy < boyEsik * atr   // yüksek çaba, küçük sonuç
                     float gR = setupYon == 1 ? high + tick : low - tick
-                    [sR, rR] = stopHesapla(setupYon, gR, setupYon == 1 ? low : high, atr, ekPayAcik, ekPay, minRiskAtr)
-                    string nedenR = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "VWAP ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : engelKontrol(setupYon, gR, rR, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
+                    [sR, rR] = stopHesapla(setupYon, gR, setupYon == 1 ? low : high, atr, ekPayAcik, ekPay, minRiskAtr, minStopYuzde)
+                    string nedenR = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "Bias ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : 2 * komisyon / 100 * gR + 2 * kaymaTick * tick > maxMaliyet / 100 * rR ? "Stop maliyete göre dar" : engelKontrol(setupYon, gR, rR, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
                     if setupYon == 1
                         evReloadLong := true
                     else

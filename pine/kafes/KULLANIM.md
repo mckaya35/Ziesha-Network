@@ -22,6 +22,20 @@ Dosyalar:
 - Gerçek order flow (emir defteri, işlem hızı, footprint) **yoktur**. İnisiyatif, emilim ve kabul; mum gövdesi, RVOL ve VWAP'tan yapılan **OHLCV tahminleridir**.
 - Dengeli (yatay/dalgalı) günlerde sistem **para kaybeder**. Gün tipi filtresi, 2 başarısız müzayededen sonra kafesin kapanması ve günlük durma kuralı bunu sınırlamak içindir, ortadan kaldırmaz.
 
+## Bias, maliyet ve minimum stop
+- **Bias zorunlu:** LONG yalnızca kapanış > seans VWAP, SHORT yalnızca kapanış < seans VWAP iken. Emir kurulurken ve bekleyen emir her bar kapanışında yeniden kontrol edilir; bias bozulursa emir iptal edilir ("Son iptal: Bias ters"). VWAP hesaplanamıyorsa (hacim yok) işlem açılmaz.
+- Dolum barının **kendi** kapanışı kullanılmaz: stop emri bar içinde dolar, kapanış ise ancak dolumdan sonra bilinir. Onu kullanmak geleceği görmek (repaint / hayali backtest) olurdu. Debug etiketi dolum barı kapanışındaki bias'ı ayrıca gösterir.
+- **Maliyet filtresi:** 2 × komisyon% × fiyat + 2 × kayma × tick, stop mesafesinin %15'inden büyükse işleme girilmez ("Stop maliyete göre dar").
+- **Minimum stop** = max(0,3 × ATR, fiyatın %0,35'i).
+- Dikkat: Komisyon %0,05 iken gidiş-dönüş maliyeti fiyatın ≈ %0,10'udur. %15 kuralı bu yüzden stopun fiyatın en az ≈ %0,67'si (+ kayma) olmasını fiilen zorunlu kılar; %0,35'lik minimum stop tek başına yetmez ve bu işlemler maliyet filtresine takılır. Düşük komisyonlu (maker) hesapta eşik düşer.
+
+## Risksiz (başa baş) mantığı
+- Fiyat girişten 1R lehe gittikten sonra stop giriş ± 1 tick'e çekilir; **ancak** bar kapanışı bu seviyenin lehe tarafındaysa. Kapanış girişin gerisine dönmüşse stop orada kurulmaz (piyasanın yanlış tarafında kalan stop sonraki açılışta zararla dolar); ilk uygun kapanışta kurulur.
+- Bu kuralla risksiz işlemin brüt sonucu ≥ +1 tick, net sonucu ≥ −maliyet olur. Tek istisna, açılışın stopun ötesinde olduğu gap'tir (7/24 kripto 1–5 dk'da nadir). Tablodaki "Risksiz" satırı bunu sayar: ihlal > 0 ise o işlemler gap kaynaklıdır.
+
+## Debug
+"Debug" açıkken her girişte küçük etiket: VWAP, bias (✓/✗), stop mesafesi (ATR) ve maliyet/R.
+
 ## Simülasyon varsayımları (tablo istatistiği)
 - Stop emri, sinyal barından sonraki barlarda tetiklenir; bar girişin ötesinde açıldıysa giriş = açılış.
 - R, **planlanan** risk (giriş − stop) üzerinden hesaplanır; gap kayması R'yi düşürür.

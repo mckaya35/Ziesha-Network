@@ -31,7 +31,6 @@ darEsik      = input.float(0.5, "Çok dar eşiği (× ATR14)", minval=0.1, step=
 genisEsik    = input.float(4.0, "Çok geniş eşiği (× ATR14)", minval=0.5, step=0.5, group=G_KAFES)
 
 // ── Modül 3: Bias ──
-vwapFiltre      = input.bool(true, "VWAP yön filtresi", group=G_BIAS, tooltip="LONG: kapanış > VWAP, SHORT: kapanış < VWAP. VWAP kafes penceresinin başından çapalıdır.")
 gunKatsayi      = input.float(1.5, "Güçlü gün eşiği (× ADR20)", minval=1.0, step=0.1, group=G_BIAS, tooltip="Son 2 tamamlanmış günün ikisi de bu eşikten büyükse 'Dengeli gün beklentisi'.")
 gunTipiMod      = input.string("Uyar", "Dengeli gün beklentisinde", options=["Uyar", "Sinyali gizle", "Riski yarıya indir"], group=G_BIAS)
 haftaSonuFiltre = input.bool(true, "Cumartesi–Pazar sinyal yok (UTC)", group=G_BIAS)
@@ -52,6 +51,8 @@ bekleme      = input.int(5, "Aynı yönde bekleme (bar)", minval=0, maxval=50, g
 ekPayAcik    = input.bool(false, "Stopa ek pay ekle", inline="pay", group=G_GIRIS)
 ekPay        = input.float(0.1, "× ATR", minval=0.0, step=0.05, inline="pay", group=G_GIRIS)
 minRiskAtr   = input.float(0.3, "Min. stop mesafesi (× ATR)", minval=0.05, step=0.05, group=G_GIRIS)
+minStopYuzde = input.float(0.35, "Min. stop mesafesi (% fiyat)", minval=0.0, step=0.05, group=G_GIRIS, tooltip="Min. stop = max(ATR × katsayı, fiyat × bu yüzde).")
+maxMaliyet   = input.float(15.0, "Maks. maliyet / stop mesafesi (%)", minval=1.0, maxval=100.0, step=1.0, group=G_GIRIS, tooltip="Gidiş-dönüş maliyeti (2 × komisyon% × fiyat + 2 × kayma tick) stop mesafesinin bu yüzdesini aşarsa işleme girilmez.")
 hedefMod     = input.string("Takip", "Hedef", options=["Takip", "Sabit R"], group=G_GIRIS)
 hedefR       = input.float(3.0, "Sabit hedef (R)", minval=0.5, step=0.5, group=G_GIRIS)
 
@@ -77,6 +78,7 @@ sonucGoster     = input.bool(true, "Sonuç etiketleri", group=G_GORUN)
 tabloGoster     = input.bool(true, "Tablo", group=G_GORUN)
 inisiyatifVurgu = input.bool(false, "İnisiyatif mumlarını vurgula", group=G_GORUN)
 rvolNokta       = input.bool(false, "RVOL noktaları", group=G_GORUN)
+debugGoster     = input.bool(false, "Debug", group=G_GORUN, tooltip="Her girişte küçük etiket: VWAP, bias (dolum barı kapanışına göre), stop mesafesi (ATR), maliyet/R.")
 
 color C_LONG  = #26a69a
 color C_SHORT = #ef5350
@@ -87,8 +89,22 @@ float tick    = syminfo.mintick
 // YARDIMCI FONKSİYONLAR
 // ════════════════════════════════════════════════════════════════════════════
 // Etiket ekler, diziye koyar; 30'dan fazlaysa en eskisini siler.
-etiketEkle(array<label> arr, int x, float y, string txt, color renk, bool ustte, string ipucu) =>
-    label lb = label.new(x=x, y=y, text=txt, xloc=xloc.bar_index, yloc=yloc.price, color=renk, style=ustte ? label.style_label_down : label.style_label_up, textcolor=color.white, size=size.small, tooltip=ipucu)
+// Aynı/yakın (≤2 bar) barlardaki işaretler dikeyde en az 0,4 × ATR aralıkla kaydırılır.
+// st: [üst son bar, üst son y, alt son bar, alt son y]
+etiketEkle(array<label> arr, array<float> st, float atrD, int x, float y, string txt, color renk, bool ustte, string ipucu) =>
+    float yy = y
+    float adim = 0.4 * atrD
+    if ustte
+        if not na(array.get(st, 0)) and x - array.get(st, 0) <= 2 and yy < array.get(st, 1) + adim
+            yy := array.get(st, 1) + adim
+        array.set(st, 0, x)
+        array.set(st, 1, yy)
+    else
+        if not na(array.get(st, 2)) and x - array.get(st, 2) <= 2 and yy > array.get(st, 3) - adim
+            yy := array.get(st, 3) - adim
+        array.set(st, 2, x)
+        array.set(st, 3, yy)
+    label lb = label.new(x=x, y=yy, text=txt, xloc=xloc.bar_index, yloc=yloc.price, color=renk, style=ustte ? label.style_label_down : label.style_label_up, textcolor=color.white, size=size.small, tooltip=ipucu)
     array.push(arr, lb)
     if array.size(arr) > 30
         label.delete(array.shift(arr))
@@ -108,12 +124,13 @@ fmtR(float r) =>
     (r >= 0 ? "+" : "−") + str.tostring(math.abs(r), "0.0") + "R"
 
 // Stop hesabı: ham stop + opsiyonel pay; min. risk altına düşerse genişletilir.
-stopHesapla(int yon, float giris, float hamStop, float atrD, bool payAcik, float payAtr, float minAtr) =>
+stopHesapla(int yon, float giris, float hamStop, float atrD, bool payAcik, float payAtr, float minAtr, float minYuzde) =>
     float s = hamStop - yon * (payAcik ? payAtr * atrD : 0.0)
     float r = yon * (giris - s)
-    if r < minAtr * atrD
-        s := giris - yon * minAtr * atrD
-        r := minAtr * atrD
+    float minMesafe = math.max(minAtr * atrD, minYuzde / 100 * giris)
+    if r < minMesafe
+        s := giris - yon * minMesafe
+        r := minMesafe
     [s, r]
 
 // Engel kontrolü: giriş ile 1R arasında önemli seviye varsa neden döner, yoksa "".
@@ -279,6 +296,10 @@ var float islemHedef = na
 var float islemCarpan = 1.0
 var int islemGirisBar = na
 var bool riskSifir = false
+var float islemMFE = na
+var int rfSayi = 0
+var int rfIhlal = 0
+var float rfEnKotu = na
 var int islemNo = 0
 var int sonKapanisL = na
 var int sonKapanisS = na
@@ -295,6 +316,9 @@ var array<int> modeller = array.new<int>()
 
 // Çizimler
 var array<label> etiketler = array.new<label>()
+var array<float> yerler = array.new<float>(4, na)
+var array<label> kafesEtiketler = array.new<label>()
+var label aktifKafesEtiket = na
 var array<line> cizgiler = array.new<line>()
 var array<int> cizgiNo = array.new<int>()
 var line girisCizgi = na
@@ -374,10 +398,15 @@ if barstate.isconfirmed
         evKafesTamam := true
         if kutuGoster
             string kutuMetin = kafesDurum == 2 ? "Kafes" : kafesDurum == 3 ? "Kafes: çok dar" : "Kafes: çok geniş"
-            aktifKutu := box.new(left=kafesBasZaman, top=kafesUst, right=aktifBitis, bottom=kafesAlt, xloc=xloc.bar_time, border_color=color.new(color.gray, 60), bgcolor=color.new(color.gray, 85), text=kutuMetin, text_size=size.small, text_color=color.new(color.gray, 30), text_halign=text.align_left, text_valign=text.align_top)
+            aktifKutu := box.new(left=kafesBasZaman, top=kafesUst, right=aktifBitis, bottom=kafesAlt, xloc=xloc.bar_time, border_color=color.new(color.gray, 60), bgcolor=color.new(color.gray, 85))
             array.push(kutular, aktifKutu)
             if array.size(kutular) > 10
                 box.delete(array.shift(kutular))
+            // Kafes etiketi kutunun üst kenarının hemen üstünde
+            aktifKafesEtiket := label.new(x=kafesBasZaman, y=kafesUst, text=kutuMetin, xloc=xloc.bar_time, yloc=yloc.price, color=color.new(color.gray, 100), style=label.style_label_lower_left, textcolor=color.gray, size=size.small)
+            array.push(kafesEtiketler, aktifKafesEtiket)
+            if array.size(kafesEtiketler) > 10
+                label.delete(array.shift(kafesEtiketler))
 
     bool kafesAktif = kafesDurum == 2 and not na(aktifBitis) and time < aktifBitis
     bool sureBitti = kafesDurum >= 2 and not na(aktifBitis) and time_close >= aktifBitis
@@ -400,6 +429,7 @@ if barstate.isconfirmed
             islemCarpan := emirCarpan
             islemGirisBar := bar_index
             riskSifir := false
+            islemMFE := emirYon == 1 ? high : low
             islemNo += 1
             emirVar := false
             girisBari := true
@@ -414,10 +444,26 @@ if barstate.isconfirmed
                     cizgiEkle(cizgiler, cizgiNo, hedefCizgi, islemNo)
                 else
                     hedefCizgi := na
+            if debugGoster
+                bool dbBias = emirYon == 1 ? close > vwapD : close < vwapD
+                float dbMaliyetR = (2 * komisyon / 100 * dolum + 2 * kaymaTick * tick) / islemRisk
+                string dbMetin = "VWAP " + str.tostring(vwapD, format.mintick) + " · Bias " + (dbBias ? "✓" : "✗") + " · Stop " + str.tostring(islemRisk / atr, "0.00") + " ATR · Maliyet/R %" + str.tostring(100 * dbMaliyetR, "0.0")
+                label dbl = etiketEkle(etiketler, yerler, atr, bar_index, emirYon == 1 ? low - 0.25 * atr : high + 0.25 * atr, dbMetin, color.new(color.blue, 30), emirYon == -1, "Debug · " + (islemModel == 1 ? "Momentum" : "Reload") + "\nBias dolum barı kapanışına göre; karar önceki kapanışta verildi.")
+                label.set_size(dbl, size.tiny)
         else if bar_index >= emirBar + emirOmur
             // GEÇİŞ: emir süresi doldu → iptal
             emirVar := false
             sonIptal := (emirModel == 1 ? "Momentum" : "Reload") + " emri tetiklenmedi"
+
+    // ── Bias (zorunlu): bekleyen emir her kapanışta yeniden doğrulanır ──
+    // Emir, bir sonraki barda yalnızca son kapanışta bias uyuyorsa tetiklenebilir.
+    // (Dolum barının kendi kapanışı dolumdan SONRA bilinir; onu kullanmak geleceği görmek olur.)
+    if emirVar and not islemVar and bar_index > emirBar
+        bool biasTutuyor = emirYon == 1 ? not na(vwapD) and close > vwapD : not na(vwapD) and close < vwapD
+        if not biasTutuyor
+            // GEÇİŞ: emir → iptal
+            emirVar := false
+            sonIptal := "Bias ters"
 
     // ── MODÜL 6/8: Bar içi çıkış (stop önce – kötümser) ──
     bool kapanis = false
@@ -455,7 +501,7 @@ if barstate.isconfirmed
                 shortIptal := true
             evBM := true
             if isaretGoster
-                etiketEkle(etiketler, bar_index, setupYon == 1 ? high + 0.25 * atr : low - 0.25 * atr, "BM", C_BM, setupYon == 1, "Başarısız müzayede: kırılım geri alındı, fiyat kafese döndü. " + (setupYon == 1 ? "LONG" : "SHORT") + " fikri bu kafes için iptal.")
+                etiketEkle(etiketler, yerler, atr, bar_index, setupYon == 1 ? high + 0.25 * atr : low - 0.25 * atr, "BM", C_BM, setupYon == 1, "Başarısız müzayede: kırılım geri alındı, fiyat kafese döndü. " + (setupYon == 1 ? "LONG" : "SHORT") + " fikri bu kafes için iptal.")
             sonIptal := "Başarısız müzayede (" + (setupYon == 1 ? "LONG" : "SHORT") + ")"
             setupDurum := 0
             emirVar := false
@@ -463,8 +509,8 @@ if barstate.isconfirmed
                 // GEÇİŞ → 5 (Kapalı): iki başarısız müzayede = dalgalı kafes
                 kafesDurum := 5
                 sonIptal := "Kafes: dalgalı, işlem yok"
-                if not na(aktifKutu)
-                    box.set_text(aktifKutu, "Kafes: kapalı (dalgalı)")
+                if not na(aktifKafesEtiket)
+                    label.set_text(aktifKafesEtiket, "Kafes: kapalı (dalgalı)")
 
     // ── MODÜL 6: Kapanış bazlı çıkışlar (BM çıkış, zaman stopu) ──
     if islemVar and not kapanis
@@ -488,6 +534,12 @@ if barstate.isconfirmed
         while array.size(sonuclar) > istN
             array.shift(sonuclar)
             array.shift(modeller)
+        // Risksiz doğrulama: stop girişe çekildiyse brüt R ≥ +1 tick olmalı (net ≥ −maliyet)
+        if riskSifir
+            rfSayi += 1
+            rfEnKotu := na(rfEnKotu) ? netR : math.min(rfEnKotu, netR)
+            if brutR < 0
+                rfIhlal += 1
         // Günlük sayaçlar (kayıp = fiyat bazında zarar; başa baş sayılmaz)
         gunR += netR
         if brutR < 0
@@ -517,7 +569,7 @@ if barstate.isconfirmed
                 array.shift(cizgiNo)
         if sonucGoster
             string ipucu = (islemYon == 1 ? "LONG" : "SHORT") + " · " + (islemModel == 1 ? "Momentum" : "Reload") + "\nGiriş: " + str.tostring(islemGiris, format.mintick) + "\nÇıkış: " + str.tostring(cikisF, format.mintick) + "\nÇıkış nedeni: " + cikisNeden + "\nBar sayısı: " + str.tostring(bar_index - islemGirisBar) + "\nBrüt R: " + str.tostring(brutR, "0.00") + " · Net R: " + str.tostring(netR, "0.00") + (islemCarpan < 1 ? "\n(Risk yarıya indirildi)" : "")
-            etiketEkle(etiketler, bar_index, netR >= 0 ? high + 0.25 * atr : low - 0.25 * atr, fmtR(netR), netR >= 0 ? C_LONG : C_SHORT, netR >= 0, ipucu)
+            etiketEkle(etiketler, yerler, atr, bar_index, netR >= 0 ? high + 0.25 * atr : low - 0.25 * atr, fmtR(netR), netR >= 0 ? C_LONG : C_SHORT, netR >= 0, ipucu)
         // GEÇİŞ: işlem → yok; kurulum biter
         islemVar := false
         setupDurum := 0
@@ -527,11 +579,16 @@ if barstate.isconfirmed
     if islemVar
         float eskiStop = islemStop
         bool sifirOnce = riskSifir
+        islemMFE := islemYon == 1 ? math.max(islemMFE, high) : math.min(islemMFE, low)
         if not riskSifir
-            bool ulasti = islemYon == 1 ? high >= islemGiris + riskSifirR * islemRisk : low <= islemGiris - riskSifirR * islemRisk
-            if ulasti
+            float beStop = islemGiris + islemYon * tick
+            bool ulasti = islemYon == 1 ? islemMFE >= islemGiris + riskSifirR * islemRisk : islemMFE <= islemGiris - riskSifirR * islemRisk
+            // BE stopu yalnızca kapanış stopun lehe tarafındaysa kurulur; aksi halde
+            // stop piyasanın yanlış tarafında kalır ve sonraki açılışta zararla dolar.
+            // Eşiğe ulaşılmış ama kapanış geride kalmışsa, ilk uygun kapanışta kurulur.
+            bool uygun = islemYon == 1 ? close > beStop : close < beStop
+            if ulasti and uygun
                 // GEÇİŞ: Risk → Risksiz (stop giriş + 1 tick)
-                float beStop = islemGiris + islemYon * tick
                 islemStop := islemYon == 1 ? math.max(islemStop, beStop) : math.min(islemStop, beStop)
                 riskSifir := true
                 evRiskSifir := true
@@ -553,8 +610,9 @@ if barstate.isconfirmed
 
     // ── Sinyal izin kontrolleri ──
     string genelEngel = gunlukLimit ? "Günlük limit doldu" : haftaSonuFiltre and haftaSonu ? "Hafta sonu" : dengeliGun and gunTipiMod == "Sinyali gizle" ? "Dengeli gün beklentisi" : ""
-    bool vwapLongOk = not vwapFiltre or na(vwapD) or close > vwapD
-    bool vwapShortOk = not vwapFiltre or na(vwapD) or close < vwapD
+    // Bias (zorunlu): LONG close > seans VWAP, SHORT close < seans VWAP. VWAP yoksa izin yok.
+    bool vwapLongOk = not na(vwapD) and close > vwapD
+    bool vwapShortOk = not na(vwapD) and close < vwapD
     bool bekLongOk = na(sonKapanisL) or bar_index - sonKapanisL >= bekleme
     bool bekShortOk = na(sonKapanisS) or bar_index - sonKapanisS >= bekleme
     float carpanYeni = dengeliGun and gunTipiMod == "Riski yarıya indir" ? 0.5 : 1.0
@@ -574,12 +632,12 @@ if barstate.isconfirmed
             kabulBar := bar_index
             evKabul := true
             if isaretGoster
-                etiketEkle(etiketler, bar_index, setupYon == 1 ? low - 0.25 * atr : high + 0.25 * atr, "✓", setupYon == 1 ? C_LONG : C_SHORT, setupYon == -1, "KABUL: kırılımdan sonra " + str.tostring(kabulN) + " bar kafes dışında kapanış.")
+                etiketEkle(etiketler, yerler, atr, bar_index, setupYon == 1 ? low - 0.25 * atr : high + 0.25 * atr, "✓", setupYon == 1 ? C_LONG : C_SHORT, setupYon == -1, "KABUL: kırılımdan sonra " + str.tostring(kabulN) + " bar kafes dışında kapanış.")
             // ── MODÜL 5A: Momentum emri (kabul mumundan sonra stop emri) ──
             if girisModeli != "Reload"
                 float gM = setupYon == 1 ? kabulH + tick : kabulL - tick
-                [sM, rM] = stopHesapla(setupYon, gM, setupYon == 1 ? kabulL : kabulH, atr, ekPayAcik, ekPay, minRiskAtr)
-                string nedenM = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "VWAP ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : engelKontrol(setupYon, gM, rM, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
+                [sM, rM] = stopHesapla(setupYon, gM, setupYon == 1 ? kabulL : kabulH, atr, ekPayAcik, ekPay, minRiskAtr, minStopYuzde)
+                string nedenM = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "Bias ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : 2 * komisyon / 100 * gM + 2 * kaymaTick * tick > maxMaliyet / 100 * rM ? "Stop maliyete göre dar" : engelKontrol(setupYon, gM, rM, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
                 if nedenM == ""
                     emirVar := true
                     emirYon := setupYon
@@ -612,15 +670,15 @@ if barstate.isconfirmed
                 if tetik
                     bool guclu = hacimVar and rvol >= rvolEsik and mumBoy < boyEsik * atr   // yüksek çaba, küçük sonuç
                     float gR = setupYon == 1 ? high + tick : low - tick
-                    [sR, rR] = stopHesapla(setupYon, gR, setupYon == 1 ? low : high, atr, ekPayAcik, ekPay, minRiskAtr)
-                    string nedenR = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "VWAP ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : engelKontrol(setupYon, gR, rR, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
+                    [sR, rR] = stopHesapla(setupYon, gR, setupYon == 1 ? low : high, atr, ekPayAcik, ekPay, minRiskAtr, minStopYuzde)
+                    string nedenR = genelEngel != "" ? genelEngel : not (setupYon == 1 ? vwapLongOk : vwapShortOk) ? "Bias ters" : not (setupYon == 1 ? bekLongOk : bekShortOk) ? "Bekleme süresi" : not kafesAktif ? "Kafes aktif değil" : 2 * komisyon / 100 * gR + 2 * kaymaTick * tick > maxMaliyet / 100 * rR ? "Stop maliyete göre dar" : engelKontrol(setupYon, gR, rR, oncekiGunH, oncekiGunL, oncekiKafesUst, oncekiKafesAlt)
                     if setupYon == 1
                         evReloadLong := true
                     else
                         evReloadShort := true
                     if reloadGoster
                         string ipR = "Reload tetiği " + (setupYon == 1 ? "LONG" : "SHORT") + (guclu ? " (yüksek çaba, küçük sonuç)" : "") + "\nGiriş: " + str.tostring(gR, format.mintick) + "\nStop: " + str.tostring(sR, format.mintick) + (nedenR == "" ? "" : "\nİptal: " + nedenR)
-                        etiketEkle(etiketler, bar_index, setupYon == 1 ? low - 0.25 * atr : high + 0.25 * atr, guclu ? "R+" : "R", nedenR == "" ? (setupYon == 1 ? C_LONG : C_SHORT) : color.gray, setupYon == -1, ipR)
+                        etiketEkle(etiketler, yerler, atr, bar_index, setupYon == 1 ? low - 0.25 * atr : high + 0.25 * atr, guclu ? "R+" : "R", nedenR == "" ? (setupYon == 1 ? C_LONG : C_SHORT) : color.gray, setupYon == -1, ipR)
                     if nedenR == ""
                         emirVar := true
                         emirYon := setupYon
@@ -653,7 +711,7 @@ if barstate.isconfirmed
                 else
                     evKirilimAsagi := true
                 if isaretGoster
-                    etiketEkle(etiketler, bar_index, kL ? high + 0.25 * atr : low - 0.25 * atr, kL ? "K↑" : "K↓", kL ? C_LONG : C_SHORT, kL, "Kırılım " + (kL ? "yukarı" : "aşağı") + " · deneme " + str.tostring(denemeSayisi) + "/2\nRVOL: " + (hacimVar ? str.tostring(rvol, "0.00") : "hacim yok") + "\nGövde: %" + str.tostring(100 * govde / mumBoy, "0"))
+                    etiketEkle(etiketler, yerler, atr, bar_index, kL ? high + 0.25 * atr : low - 0.25 * atr, kL ? "K↑" : "K↓", kL ? C_LONG : C_SHORT, kL, "Kırılım " + (kL ? "yukarı" : "aşağı") + " · deneme " + str.tostring(denemeSayisi) + "/2\nRVOL: " + (hacimVar ? str.tostring(rvol, "0.00") : "hacim yok") + "\nGövde: %" + str.tostring(100 * govde / mumBoy, "0"))
 
     // ── Kafes aktif süresi bitti → GEÇİŞ → 0 (Bekleniyor) ──
     if sureBitti
@@ -676,11 +734,12 @@ plotshape(rvolNokta and hacimVar and rvol >= rvolEsik, "RVOL yüksek", style=sha
 // ════════════════════════════════════════════════════════════════════════════
 var table tb = na
 if barstate.isfirst and tabloGoster
-    tb := table.new(position.top_right, 7, 12, bgcolor=color.new(#131722, 15), border_color=color.new(color.gray, 75), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+    tb := table.new(position.top_right, 7, 15, bgcolor=color.new(#131722, 15), border_color=color.new(color.gray, 75), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
     table.merge_cells(tb, 0, 0, 6, 0)
     for r = 1 to 6
         table.merge_cells(tb, 1, r, 6, r)
-    table.merge_cells(tb, 1, 11, 6, 11)
+    for r = 11 to 14
+        table.merge_cells(tb, 1, r, 6, r)
 
 satirYaz(table t, int row, string ad, int n, int k, float top, int seri, float dd) =>
     color tc = color.white
@@ -762,6 +821,17 @@ if barstate.islast and not na(tb)
         uyari += "Kafes penceresi grafik zaman diliminden kısa!"
     table.cell(tb, 0, 11, "Uyarı", text_color=tc, text_size=size.small, text_halign=text.align_left)
     table.cell(tb, 1, 11, uyari == "" ? "—" : uyari, text_color=uyari == "" ? tc : C_SHORT, text_size=size.small, text_halign=text.align_left)
+
+    // Risksiz doğrulama
+    string rfMetin = "Risksiz kapanan: " + str.tostring(rfSayi) + " · ihlal (brüt < 0): " + str.tostring(rfIhlal) + (na(rfEnKotu) ? "" : " · en kötü net: " + str.tostring(rfEnKotu, "0.00") + "R")
+    table.cell(tb, 0, 12, "Risksiz", text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 12, rfMetin, text_color=rfIhlal > 0 ? C_SHORT : tc, text_size=size.small, text_halign=text.align_left)
+
+    // İşaret açıklaması (lejant)
+    table.cell(tb, 0, 13, "İşaretler", text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 13, "K↑ / K↓: kafes kırılımı yukarı / aşağı · ✓: kabul (" + str.tostring(kabulN) + " bar kafes dışında kapanış)", text_color=tc, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 0, 14, "", text_color=tc, text_size=size.small)
+    table.cell(tb, 1, 14, "BM: başarısız müzayede, fiyat kafese döndü, o yön iptal · R / R+: reload tetiği (+: yüksek hacim, küçük mum)", text_color=tc, text_size=size.small, text_halign=text.align_left)
 
 // ════════════════════════════════════════════════════════════════════════════
 // MODÜL 9: ALARMLAR
