@@ -70,6 +70,17 @@ python export_pine.py --exp exp4h --retrain
 ```
 Walk-forward GEÇMEDİ ise Pine üretilmez (`--force` ile DEMO).
 
+## H2 — haftalık kesitsel momentum (ön kayıtlı: `HYPOTHESIS_H2.md`)
+H1 (lojistik skor) iki deneyde de GEÇMEDİ. H2, kod yazılmadan önce commit'lenen ön kayda birebir uyar (20 coin, 4h veri,
+28 günlük getiriye göre top 4 long / bottom 4 short, haftalık).
+```bash
+python h2_momentum.py              # A: tarihsel test (holdout hariç) -> out/h2/report.md
+python h2_momentum.py --holdout    # B: yalnızca A GEÇTİ ise, tek sefer
+python h2_momentum.py --signal     # C: yalnızca A GEÇTİ ise; her pazartesi (2026-10-05'ten itibaren) çalıştır ve commit'le
+python h2_momentum.py --forward    # C: kayıtlı sinyallerin gerçekleşen sonuçları
+```
+C için her pazartesi `forward/h2_signals.csv` git'e commit'lenmelidir (commit zamanı = sinyalin önceden kaydedildiğinin kanıtı).
+
 ## Sınırlar
 - Pine dosyası otomatik üretilir; TradingView derleyicisinde denenmesi ve `parity_check.csv` ile doğrulanması gerekir.
 - Geçmiş test gelecekteki performansı garanti etmez. Yatırım tavsiyesi değildir.
