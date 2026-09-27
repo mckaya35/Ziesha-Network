@@ -1,23 +1,45 @@
-"""Kaydırmalı walk-forward: 12 ay eğitim -> 1 ay test, 1 ay kaydır.
-Purge (eğitimin son H barı) + embargo (test öncesi H bar). Scaler/model/eşik yalnızca eğitimde."""
+"""Kaydırmalı walk-forward: 12 ay eğitim -> 1 ay test, 1 ay kaydır. TEK model, tüm sembollerin verisiyle.
+Purge (eğitimin son H barı) + embargo (test öncesi H bar). Scaler/model/eşik yalnızca eğitimde.
+Son `holdout_days` gün MÜHÜRLÜ: walk-forward buraya hiç dokunmaz (bkz. holdout_bounds)."""
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from backtest import run_backtest, trade_outcomes
-from common import load_config, load_funding, load_klines
+from common import bar_delta, load_config
+from data import load_all
 from features import compute_features, feature_names
 from labels import make_labels
 
 
-def prepare(cfg, symbol):
-    df = load_klines(cfg, symbol)
-    fund = load_funding(cfg, symbol)
-    feat = compute_features(df, cfg)
-    lab = make_labels(df, cfg["label"]["H"], cfg["label"]["up"], cfg["label"]["adverse"])
-    oc = {1: trade_outcomes(df, fund, 1, cfg), -1: trade_outcomes(df, fund, -1, cfg)}
-    return df, feat, lab, oc
+def prepare(cfg, raw=None, use_api=True):
+    """{sym: {"df", "fund", "feat", "lab", "oc"}}"""
+    if raw is None:
+        raw, _, _ = load_all(cfg, use_api)
+    L = cfg["label"]
+    out = {}
+    for sym, (df, fund) in raw.items():
+        out[sym] = {"df": df, "fund": fund, "feat": compute_features(df, cfg),
+                    "lab": make_labels(df, L["H"], L["up"], L["adverse"]),
+                    "oc": {s: trade_outcomes(df, fund, s, cfg) for s in (1, -1)}}
+    return out
+
+
+def holdout_bounds(cfg, data):
+    """(ilk test ayı, walk-forward sinyal sonu, holdout başlangıcı, veri sonu)."""
+    bar, H = bar_delta(cfg), cfg["label"]["H"]
+    first = min(d["df"].index[0] for d in data.values())
+    end = max(d["df"].index[-1] for d in data.values()) + bar
+    hold = (end - pd.Timedelta(days=cfg["walkforward"]["holdout_days"])).floor("D")
+    wf_end = hold - (H + 1) * bar        # WF işlemleri holdout başlamadan kapanmış olur (fiyatına bile bakmaz)
+    ft = cfg["walkforward"]["first_test"]
+    if ft == "auto":
+        t = first + pd.DateOffset(months=cfg["walkforward"]["train_months"])
+        ft = (t - pd.Timedelta(1, "ns")).normalize() + pd.offsets.MonthBegin(1)     # t'den sonraki ilk ay başı (t dahil)
+    else:
+        ft = pd.Timestamp(ft + "-01", tz="UTC")
+    return ft, wf_end, hold, end
 
 
 def fit(X, y, C):
@@ -30,57 +52,67 @@ def predict(sc, m, X):
     return m.predict_proba(sc.transform(X))[:, 1]
 
 
-def usable(feat, lab, pos, side_col):
-    """pos içindeki, özellik ve etiketi tam olan satır pozisyonları."""
-    ok = feat.iloc[pos].notna().all(axis=1).to_numpy() & lab[side_col].iloc[pos].notna().to_numpy()
+def usable(d, pos, col):
+    ok = d["feat"].iloc[pos].notna().all(axis=1).to_numpy() & d["lab"][col].iloc[pos].notna().to_numpy()
     return pos[ok]
 
 
-def select_threshold(p_val, pos_val, oc_side, side, cfg):
-    """Doğrulama bölümünde net ort. R > 0 olan eşikler arasından toplam R'si en yüksek olanı seç.
-    Hiçbiri pozitif değilse None (o fold'da bu yönde işlem yok)."""
-    wf, T = cfg["walkforward"], len(oc_side)
-    best, best_tot, table = None, -np.inf, []
+def fold_positions(index, test_start, test_end, cfg):
+    """Bir sembol için eğitim ve test satır pozisyonları (sızıntısız)."""
+    H = cfg["label"]["H"]
+    p0, p1 = int(index.searchsorted(test_start)), int(index.searchsorted(test_end))
+    q0 = int(index.searchsorted(test_start - pd.DateOffset(months=cfg["walkforward"]["train_months"])))
+    q1 = p0 - H - H           # embargo H + purge H
+    return np.arange(q0, max(q0, q1)), np.arange(p0, p1)
+
+
+def pooled_backtest(data, pos_by_sym, probs_by_sym, thr, side):
+    """Tek yön, tek eşik, tüm semboller -> işlemlerin R dizisi."""
+    Rs = []
+    for s, pos in pos_by_sym.items():
+        sig = np.zeros(len(data[s]["df"]), dtype=int)
+        sig[pos[probs_by_sym[s] >= thr]] = side
+        tr = run_backtest({side: data[s]["oc"][side]}, sig, s)
+        Rs.append(tr["R"].to_numpy(float))
+    return np.concatenate(Rs) if Rs else np.array([])
+
+
+def select_threshold(data, pos_val, p_val, side, cfg):
+    """Doğrulamada net ort. R > 0 ve ≥ min_val_trades olan eşiklerden toplam R'si en yüksek olan; yoksa None."""
+    wf = cfg["walkforward"]
+    best, best_tot = None, -np.inf
     for thr in wf["thresholds"]:
-        sig = np.zeros(T, dtype=int)
-        sig[pos_val[p_val >= thr]] = side
-        tr = run_backtest({side: oc_side, -side: oc_side}, sig)
-        n = len(tr); mean = tr["R"].mean() if n else np.nan; tot = tr["R"].sum() if n else 0.0
-        table.append((thr, n, mean))
-        if n >= wf["min_val_trades"] and mean > 0 and tot > best_tot:
-            best, best_tot = thr, tot
-    return best, table
+        R = pooled_backtest(data, pos_val, p_val, thr, side)
+        if len(R) >= wf["min_val_trades"] and R.mean() > 0 and R.sum() > best_tot:
+            best, best_tot = thr, R.sum()
+    return best
 
 
-def train_block(feat, lab, oc, pos_train, cfg):
-    """pos_train: purge edilmiş eğitim satır pozisyonları (zaman sıralı).
-    Dönüş: {side: (scaler, model, threshold)}. Eşik yalnızca eğitim içi son %20'de seçilir."""
+def train_block(data, pos_train, cfg):
+    """pos_train: {sym: purge edilmiş eğitim pozisyonları}. Dönüş {side: (scaler, model, eşik)}."""
     H, C, vf = cfg["label"]["H"], cfg["walkforward"]["C"], cfg["walkforward"]["val_frac"]
     names = feature_names(cfg)
+    X = lambda pb: pd.concat([data[s]["feat"][names].iloc[p] for s, p in pb.items()])
     res = {}
     for side, col in ((1, "label_up"), (-1, "label_dn")):
-        pos = usable(feat, lab, pos_train, col)
-        n_val = int(len(pos) * vf)
-        pos_val = pos[-n_val:]
-        pos_in = pos[: len(pos) - n_val]
-        pos_in = pos_in[pos_in < pos_val[0] - H]              # iç purge: etiketi doğrulamaya taşan satırlar
-        sc, m = fit(feat[names].iloc[pos_in], lab[col].iloc[pos_in].to_numpy(), C)
-        thr, _ = select_threshold(predict(sc, m, feat[names].iloc[pos_val]), pos_val, oc[side], side, cfg)
-        sc, m = fit(feat[names].iloc[pos], lab[col].iloc[pos].to_numpy(), C)   # tam eğitimle yeniden fit
+        pos = {s: usable(data[s], p, col) for s, p in pos_train.items()}
+        pos = {s: p for s, p in pos.items() if len(p)}
+        times = np.concatenate([data[s]["df"].index[p].as_unit("ns").asi8 for s, p in pos.items()])
+        val_start = pd.Timestamp(int(np.quantile(times, 1 - vf)), tz="UTC")
+        pos_val, pos_in = {}, {}
+        for s, p in pos.items():
+            idx = data[s]["df"].index
+            k = int(idx.searchsorted(val_start))
+            pos_val[s] = p[p >= k]
+            pos_in[s] = p[p < k - H]                    # iç purge
+        pos_in = {s: p for s, p in pos_in.items() if len(p)}
+        y = lambda pb: np.concatenate([data[s]["lab"][col].to_numpy()[p] for s, p in pb.items()])
+        sc, m = fit(X(pos_in), y(pos_in), C)
+        pv = {s: predict(sc, m, data[s]["feat"][names].iloc[p]) for s, p in pos_val.items() if len(p)}
+        thr = select_threshold(data, {s: pos_val[s] for s in pv}, pv, side, cfg)
+        sc, m = fit(X(pos), y(pos), C)                  # tam eğitimle yeniden fit
         res[side] = (sc, m, thr)
     return res
-
-
-def fold_positions(index, test_start, test_end, cfg):
-    """Eğitim ve test satır pozisyonları (zaman sızıntısı yok)."""
-    H = cfg["label"]["H"]
-    p0 = int(index.searchsorted(test_start))
-    p1 = int(index.searchsorted(test_end))
-    train_start = test_start - pd.DateOffset(months=cfg["walkforward"]["train_months"])
-    q0 = int(index.searchsorted(train_start))
-    cut = p0 - H            # embargo: test başlangıcından önce H bar boşluk
-    q1 = cut - H            # purge: eğitimin son H barı (etiketi ileri taşar) atılır
-    return np.arange(q0, max(q0, q1)), np.arange(p0, p1)
 
 
 def signals_from(p_up, p_dn, thr_up, thr_dn):
@@ -89,43 +121,77 @@ def signals_from(p_up, p_dn, thr_up, thr_dn):
     return np.where(lu & ~ld, 1, np.where(ld & ~lu, -1, 0))   # ikisi birden -> işlem yok
 
 
-def run(cfg):
+def predict_period(data, blk, test_start, test_end, cfg, fold):
+    """Bir test dönemi için: eğitim (test_start öncesi) + tüm sembollerde tahmin."""
     names = feature_names(cfg)
+    rows = []
+    for s, d in data.items():
+        _, te = fold_positions(d["df"].index, test_start, test_end, cfg)
+        te = te[d["feat"].iloc[te].notna().all(axis=1).to_numpy()]
+        if len(te) == 0:
+            continue
+        X = d["feat"][names].iloc[te]
+        rows.append(pd.DataFrame({"symbol": s, "fold": fold, "pos": te, "time": d["df"].index[te],
+                                  "p_up": predict(blk[1][0], blk[1][1], X), "p_dn": predict(blk[-1][0], blk[-1][1], X),
+                                  "thr_up": blk[1][2] if blk[1][2] is not None else np.nan,
+                                  "thr_dn": blk[-1][2] if blk[-1][2] is not None else np.nan}))
+    return rows
+
+
+def train_for(data, test_start, cfg, min_rows=1000):
+    pos_tr = {}
+    for s, d in data.items():
+        tr, _ = fold_positions(d["df"].index, test_start, test_start, cfg)
+        if len(tr):
+            pos_tr[s] = tr
+    if sum(len(p) for p in pos_tr.values()) < min_rows:
+        return None, pos_tr
+    return train_block(data, pos_tr, cfg), pos_tr
+
+
+def model_row(cfg, fold, side, blk_side, pos_tr, data):
+    sc, m, thr = blk_side
+    names = feature_names(cfg)
+    r = {"fold": fold, "side": side, "threshold": thr if thr is not None else np.nan, "intercept": m.intercept_[0],
+         "train_first": min(data[s]["df"].index[p[0]] for s, p in pos_tr.items()),
+         "train_last": max(data[s]["df"].index[p[-1]] for s, p in pos_tr.items()),
+         "n_symbols": len(pos_tr)}
+    r.update({f"coef_{n}": c for n, c in zip(names, m.coef_[0])})
+    r.update({f"mean_{n}": v for n, v in zip(names, sc.mean_)})
+    r.update({f"scale_{n}": v for n, v in zip(names, sc.scale_)})
+    return r
+
+
+def run(cfg, data=None):
+    data = data or prepare(cfg)
+    first, wf_end, hold, end = holdout_bounds(cfg, data)
     preds, models = [], []
-    for sym in cfg["symbols"]:
-        df, feat, lab, oc = prepare(cfg, sym)
-        idx = df.index
-        m = pd.Timestamp(cfg["walkforward"]["first_test"] + "-01", tz="UTC")
-        while m <= idx[-1]:
-            m_end = m + pd.DateOffset(months=cfg["walkforward"]["test_months"])
-            pos_tr, pos_te = fold_positions(idx, m, m_end, cfg)
-            pos_te = pos_te[feat.iloc[pos_te].notna().all(axis=1).to_numpy()]
-            if len(pos_tr) < 1000 or len(pos_te) == 0:
-                m = m_end; continue
-            blk = train_block(feat, lab, oc, pos_tr, cfg)
-            Xte = feat[names].iloc[pos_te]
-            p_up = predict(blk[1][0], blk[1][1], Xte)
-            p_dn = predict(blk[-1][0], blk[-1][1], Xte)
-            fold = m.strftime("%Y-%m")
-            preds.append(pd.DataFrame({"symbol": sym, "fold": fold, "pos": pos_te, "time": idx[pos_te],
-                                       "p_up": p_up, "p_dn": p_dn,
-                                       "thr_up": blk[1][2] if blk[1][2] is not None else np.nan,
-                                       "thr_dn": blk[-1][2] if blk[-1][2] is not None else np.nan,
-                                       "label_up": lab["label_up"].iloc[pos_te].to_numpy(),
-                                       "label_dn": lab["label_dn"].iloc[pos_te].to_numpy()}))
+    m = first
+    while m < wf_end:
+        m_end = min(m + pd.DateOffset(months=cfg["walkforward"]["test_months"]), wf_end)
+        blk, pos_tr = train_for(data, m, cfg)
+        fold = m.strftime("%Y-%m")
+        if blk is not None:
+            preds += predict_period(data, blk, m, m_end, cfg, fold)
             for side, name in ((1, "up"), (-1, "dn")):
-                sc, mdl, thr = blk[side]
-                row = {"symbol": sym, "fold": fold, "side": name, "threshold": thr if thr is not None else np.nan,
-                       "train_first": idx[pos_tr[0]], "train_last": idx[pos_tr[-1]], "intercept": mdl.intercept_[0]}
-                row.update({f"coef_{n}": c for n, c in zip(names, mdl.coef_[0])})
-                models.append(row)
-            print(sym, fold, "thr_up", blk[1][2], "thr_dn", blk[-1][2])
-            m = m_end
+                models.append(model_row(cfg, fold, name, blk[side], pos_tr, data))
+            print(cfg["exp"], fold, "semboller", len(pos_tr), "thr_up", blk[1][2], "thr_dn", blk[-1][2])
+        m = m + pd.DateOffset(months=cfg["walkforward"]["test_months"])
     preds, models = pd.concat(preds, ignore_index=True), pd.DataFrame(models)
-    preds.to_parquet(f"{cfg['out_dir']}/folds.parquet")
-    models.to_parquet(f"{cfg['out_dir']}/folds_models.parquet")
-    return preds, models
+    preds.to_parquet(f"{cfg['exp_out']}/folds.parquet")
+    models.to_parquet(f"{cfg['exp_out']}/folds_models.parquet")
+    return preds, models, data
+
+
+def run_holdout(cfg, data):
+    """Mühürlü holdout: holdout başlangıcından önceki 12 ayla eğitilir, holdout'a TEK kez uygulanır."""
+    _, _, hold, end = holdout_bounds(cfg, data)
+    blk, pos_tr = train_for(data, hold, cfg)
+    preds = pd.concat(predict_period(data, blk, hold, end, cfg, "HOLDOUT"), ignore_index=True)
+    models = pd.DataFrame([model_row(cfg, "HOLDOUT", n, blk[s], pos_tr, data) for s, n in ((1, "up"), (-1, "dn"))])
+    return preds, models, hold, end
 
 
 if __name__ == "__main__":
-    run(load_config())
+    import sys
+    run(load_config(sys.argv[1] if len(sys.argv) > 1 else "main"))

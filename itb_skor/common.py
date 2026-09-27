@@ -1,4 +1,7 @@
-"""Ortak yardımcılar: config ve veri yükleme."""
+"""Ortak yardımcılar: config (deney bazında birleştirilmiş)."""
+import copy
+import hashlib
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -7,23 +10,35 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 
 
-def load_config(path=None):
+def load_config(exp="main", path=None, overrides=None):
     with open(path or ROOT / "config.yaml") as f:
-        cfg = yaml.safe_load(f)
-    cfg["data_dir"] = str(ROOT / cfg["data_dir"])
-    cfg["out_dir"] = str(ROOT / cfg["out_dir"])
-    Path(cfg["out_dir"]).mkdir(parents=True, exist_ok=True)
+        raw = yaml.safe_load(f)
+    if overrides:
+        raw.update(overrides)
+    cfg = copy.deepcopy({k: v for k, v in raw.items() if k != "experiments"})
+    e = raw["experiments"][exp]
+    cfg.update(copy.deepcopy(e))
+    cfg["exp"] = exp
+    cfg["symbols"] = [c + cfg["quote"] for c in e["coins"]]
+    for k in ("data_dir", "out_dir", "local_data_dir", "control_predictions"):
+        if cfg.get(k):
+            p = Path(cfg[k]).expanduser()
+            cfg[k] = str(p if p.is_absolute() else (ROOT / p).resolve())
+    cfg["exp_out"] = str(Path(cfg["out_dir"]) / exp)
+    Path(cfg["exp_out"]).mkdir(parents=True, exist_ok=True)
     return cfg
 
 
-def load_klines(cfg, symbol):
-    """Index = bar AÇILIŞ zamanı (UTC). Sütunlar: open high low close volume."""
-    return pd.read_parquet(Path(cfg["data_dir"]) / f"{symbol}_{cfg['interval']}.parquet")
+def experiments(path=None):
+    with open(path or ROOT / "config.yaml") as f:
+        return list(yaml.safe_load(f)["experiments"])
 
 
-def load_funding(cfg, symbol):
-    """Index = funding zamanı (UTC), sütun: rate."""
-    p = Path(cfg["data_dir"]) / f"{symbol}_funding.parquet"
-    if not p.exists():
-        return pd.Series(dtype=float, index=pd.DatetimeIndex([], tz="UTC"), name="rate")
-    return pd.read_parquet(p)["rate"]
+def bar_delta(cfg):
+    return pd.Timedelta(cfg["interval"])
+
+
+def config_hash(cfg):
+    keys = ("interval", "symbols", "label", "features", "walkforward", "costs", "criteria")
+    s = json.dumps({k: cfg[k] for k in keys}, sort_keys=True, default=str)
+    return hashlib.sha256(s.encode()).hexdigest()[:12]

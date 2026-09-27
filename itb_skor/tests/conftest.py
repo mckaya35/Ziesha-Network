@@ -10,10 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @pytest.fixture
 def cfg():
-    return {"features": {"windows": [6, 24, 72, 168], "hour": True},
+    return {"exp": "t", "interval": "1h", "quote": "USDT", "features": {"windows": [6, 24, 72, 168], "hour": True},
             "label": {"H": 24, "up": 0.02, "adverse": 0.01},
             "walkforward": {"train_months": 12, "test_months": 1, "first_test": "2021-01", "val_frac": 0.2,
-                            "C": 1.0, "thresholds": [0.3, 0.4, 0.5, 0.6, 0.7], "min_val_trades": 10},
+                            "C": 1.0, "thresholds": [0.3, 0.4, 0.5, 0.6, 0.7], "min_val_trades": 10,
+                            "holdout_days": 30},
             "costs": {"fee": 0.0005, "slippage": 0.0002}}
 
 

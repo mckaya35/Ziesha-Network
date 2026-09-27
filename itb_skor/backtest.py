@@ -37,12 +37,12 @@ def trade_outcomes(df, funding, side, cfg, cost_mult=1.0):
 
     # Funding: (giriş anı, çıkış sınırı] aralığındaki funding anları. Long öder (+rate), short alır.
     t = df.index
-    one_h = pd.Timedelta(hours=1)
+    bar = pd.Timedelta(cfg["interval"])
     t_ns = t.as_unit("ns").asi8
     entry_t = np.r_[t_ns[1:], np.iinfo(np.int64).max]
     exit_idx = rows + k
     exit_idx_c = np.minimum(exit_idx, T - 1)
-    exit_bound = np.where(reason == "time", t_ns[exit_idx_c] + one_h.value, t_ns[exit_idx_c])
+    exit_bound = np.where(reason == "time", t_ns[exit_idx_c] + bar.value, t_ns[exit_idx_c])
     fund = np.zeros(T)
     if len(funding):
         ft = funding.index.as_unit("ns").asi8
@@ -53,30 +53,41 @@ def trade_outcomes(df, funding, side, cfg, cost_mult=1.0):
     net = gross - cost + fund_pnl
     valid = rows + H <= T - 1
     out = pd.DataFrame({"exit_idx": exit_idx, "reason": reason, "gross": gross, "cost": cost,
-                        "fund": fund_pnl, "net": net, "R": net / adv, "hold": k}, index=t)
+                        "fund": fund_pnl, "net": net, "R": net / adv, "hold": k,
+                        "hold_h": k * bar / pd.Timedelta(hours=1)}, index=t)
     out.loc[~valid, ["gross", "cost", "fund", "net", "R"]] = np.nan
     out["valid"] = valid
     return out
 
 
 def run_backtest(outcomes, signal, symbol=""):
-    """outcomes: {1: long_df, -1: short_df}; signal: bar başına +1/-1/0 (np.array, df ile hizalı).
-    Tek pozisyon kuralı: sinyal ancak önceki işlemin çıkış barı kapandıktan sonra alınır."""
-    trades, free_from = [], 0
-    idx = outcomes[1].index
+    """outcomes: {side: trade_outcomes df} (yalnızca kullanılan yönler yeterli); signal: +1/-1/0 dizisi (df ile hizalı).
+    Tek pozisyon kuralı: yeni sinyal ancak önceki işlemin çıkış barı kapandıktan sonra alınır."""
+    idx = next(iter(outcomes.values())).index
+    arr = {s: (o["valid"].to_numpy(), o["exit_idx"].to_numpy()) for s, o in outcomes.items()}
+    take, free_from = [], 0
     for i in np.flatnonzero(signal != 0):
         if i < free_from:
             continue
-        s = int(signal[i]); oc = outcomes[s]
-        if not oc["valid"].iat[i]:
+        s = int(signal[i]); valid, ex = arr[s]
+        if not valid[i]:
             continue
-        r = oc.iloc[i]
-        ex = int(r["exit_idx"])
-        trades.append({"symbol": symbol, "side": s, "signal_time": idx[i], "entry_time": idx[i + 1],
-                       "exit_time": idx[ex], "reason": r["reason"], "hold_h": int(r["hold"]),
-                       "gross": r["gross"], "cost": r["cost"], "fund": r["fund"], "net": r["net"], "R": r["R"]})
-        free_from = ex
-    return pd.DataFrame(trades)
+        take.append((i, s)); free_from = int(ex[i])
+    if not take:
+        return pd.DataFrame(columns=["symbol", "side", "signal_time", "entry_time", "exit_time", "reason",
+                                     "hold_h", "gross", "cost", "fund", "net", "R"])
+    rows = []
+    for s in (1, -1):
+        ii = np.array([i for i, x in take if x == s], dtype=int)
+        if len(ii) == 0:
+            continue
+        o = outcomes[s].iloc[ii]
+        rows.append(pd.DataFrame({"symbol": symbol, "side": s, "signal_time": idx[ii], "entry_time": idx[ii + 1],
+                                  "exit_time": idx[o["exit_idx"].to_numpy()], "reason": o["reason"].to_numpy(),
+                                  "hold_h": o["hold_h"].to_numpy(),
+                                  "gross": o["gross"].to_numpy(), "cost": o["cost"].to_numpy(), "fund": o["fund"].to_numpy(),
+                                  "net": o["net"].to_numpy(), "R": o["R"].to_numpy()}))
+    return pd.concat(rows, ignore_index=True).sort_values("signal_time", ignore_index=True)
 
 
 def metrics(tr, adv, days=None):

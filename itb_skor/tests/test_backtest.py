@@ -10,7 +10,7 @@ def bars(o, h, l, c):
 
 
 def cfg(H=3):
-    return {"label": {"H": H, "up": 0.02, "adverse": 0.01}, "costs": {"fee": 0.0005, "slippage": 0.0002}}
+    return {"interval": "1h", "label": {"H": H, "up": 0.02, "adverse": 0.01}, "costs": {"fee": 0.0005, "slippage": 0.0002}}
 
 
 NOF = pd.Series(dtype=float, index=pd.DatetimeIndex([], tz="UTC"))

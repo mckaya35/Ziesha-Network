@@ -4,5 +4,6 @@ __pycache__/
 data/
 data_synth/
 out_synth/
-out/*.parquet
-out/*.csv
+out/*/*.parquet
+out/*/*.csv
+out/*/holdout_log.json
