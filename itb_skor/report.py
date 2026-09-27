@@ -61,6 +61,11 @@ def simulate(cfg, data, preds):
     return out, rnd, bh, all_days
 
 
+def pick(df, rows):
+    """Var olan satırları seç (ör. hiç long işlem yoksa 'long' satırı olmaz)."""
+    return df.loc[[r for r in rows if r in df.index]]
+
+
 def breakdown(tr, adv, days):
     rows = {"TOPLAM": metrics(tr, adv, days)}
     if len(tr):
@@ -238,7 +243,7 @@ def holdout_section(cfg, data, wf_ok):
          f"- Bu config ({h}) ile holdout değerlendirme sayısı: {sum(e['config_hash'] == h for e in log)}"]
     if prior:
         L.append(f"- ⚠️ Holdout daha önce **farklı** config ile {len(prior)} kez görüldü → artık tam olarak mühürlü sayılmaz.")
-    L += ["", fmt(breakdown(tr, adv, days).loc[["TOPLAM", "long", "short"]] if len(tr) else breakdown(tr, adv, days)), "",
+    L += ["", fmt(pick(breakdown(tr, adv, days), ["TOPLAM", "long", "short"])), "",
           f"- SMA168 kuralı (holdout): ort. R {out['sma168']['R'].mean():.4f}, {len(out['sma168'])} işlem",
           f"- Rastgele giriş p95 (holdout): {np.nanpercentile(rnd, 95):.4f}" if len(tr) else "- Holdout'ta işlem yok",
           f"- Maliyet ×{cfg['criteria']['cost_mult']:g} (holdout): ort. R {out['model_x2']['R'].mean():.4f}" if len(tr) else "",

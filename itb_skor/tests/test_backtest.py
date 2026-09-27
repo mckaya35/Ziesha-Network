@@ -60,3 +60,13 @@ def test_single_position():
     tr = run_backtest(oc, sig)
     assert list(tr["signal_time"].dt.hour) == [0, 3]      # bar0 -> çıkış bar3; bar3 sinyali alınır
     assert tr["entry_time"].iat[0] == df.index[1]
+
+
+def test_breakdown_only_short_side():
+    from report import breakdown, pick
+    t0 = pd.Timestamp("2025-01-01", tz="UTC")
+    tr = pd.DataFrame({"symbol": "BTCUSDT", "side": -1, "signal_time": t0, "entry_time": t0, "exit_time": t0,
+                       "reason": "tp", "hold_h": 2.0, "gross": 0.02, "cost": 0.0014, "fund": 0.0, "net": 0.0186,
+                       "R": 1.86}, index=[0])
+    out = pick(breakdown(tr, 0.01, None), ["TOPLAM", "long", "short"])
+    assert list(out.index) == ["TOPLAM", "short"]
