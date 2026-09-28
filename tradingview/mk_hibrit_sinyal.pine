@@ -70,6 +70,10 @@ maxHold = input.int(0, "Maks. tutma (bar, 0 = kapalı)", minval=0, group=G_RSK, 
 revOn   = input.bool(true, "Ters sinyalde pozisyonu çevir", group=G_RSK, tooltip="Kapalıysa pozisyon yalnız SL/TP/süre ile kapanır.")
 feePct  = input.float(0.05, "Komisyon (%, taraf başı)", minval=0.0, step=0.01, group=G_RSK, tooltip="Giriş ve çıkışta ayrı ayrı düşülür (istatistik tablosu).")
 
+G_EVL     = "Değerlendirme"
+evalStart = input.time(timestamp("01 Jan 2000 00:00 +0000"), "Test dönemi başlangıcı", group=G_EVL, tooltip="Ayarları bu tarihten ÖNCEKİ dönemde seçin; tablo bu tarihten SONRA açılan işlemleri ayrı gösterir (örneklem dışı test). Varsayılan 2000: tüm işlemler test dönemine sayılır.")
+feeWarn   = input.float(30.0, "Komisyon / 1R uyarı eşiği (%)", minval=1.0, maxval=200.0, group=G_EVL, tooltip="Gidiş-dönüş komisyon, stop mesafesinin (1R) bu yüzdesini aşarsa tabloda uyarı.")
+
 autoScale   = input.bool(true, "Otomatik ölçekleme", group=G_TF, tooltip="Süreler timeframe.in_seconds() ile bara çevrilir; kapalıyken 1H değerleri.")
 trainDays   = input.float(180.0, "Ridge eğitim penceresi (gün)", minval=0.1, group=G_TF, tooltip="Bar karşılığı [300, 5000].")
 retrainDays = input.float(7.0, "Yeniden eğitim (gün)", minval=0.01, group=G_TF, tooltip="Bar karşılığı [20, 500].")
@@ -255,13 +259,18 @@ var int   tpHit  = 0
 var int   eBar   = na
 var float remQ   = 0.0
 var float tRet   = 0.0
-var int   nTr    = 0
-var int   nWin   = 0
-var float sumRet = 0.0
-var float gWin   = 0.0
-var float gLoss  = 0.0
-var float peak   = 0.0
-var float maxDD  = 0.0
+var int   eTime  = na
+// İstatistik segmentleri: 0 = ayar dönemi (test başlangıcından önce), 1 = test long, 2 = test short
+var array<float> stN  = array.new_float(3, 0.0)
+var array<float> stW  = array.new_float(3, 0.0)
+var array<float> stS  = array.new_float(3, 0.0)
+var array<float> stGW = array.new_float(3, 0.0)
+var array<float> stGL = array.new_float(3, 0.0)
+var float sumT  = 0.0
+var float peakT = 0.0
+var float ddT   = 0.0
+var float sumFeeR = 0.0
+var int   nFeeR   = 0
 var line lE  = na
 var line lS  = na
 var line lT1 = na
@@ -476,15 +485,18 @@ if barstate.isconfirmed
     if not na(closePx)
         tRet += remQ * pos * (closePx / ePx - 1) * 100
         net = tRet - 2 * feePct
-        nTr    += 1
-        sumRet += net
+        int seg = eTime < evalStart ? 0 : pos == 1 ? 1 : 2
+        stN.set(seg, stN.get(seg) + 1)
+        stS.set(seg, stS.get(seg) + net)
         if net > 0
-            nWin += 1
-            gWin += net
+            stW.set(seg, stW.get(seg) + 1)
+            stGW.set(seg, stGW.get(seg) + net)
         else
-            gLoss -= net
-        peak  := math.max(peak, sumRet)
-        maxDD := math.max(maxDD, peak - sumRet)
+            stGL.set(seg, stGL.get(seg) - net)
+        if seg > 0
+            sumT  += net
+            peakT := math.max(peakT, sumT)
+            ddT   := math.max(ddT, peakT - sumT)
         exitEvent := true
         slEvent   := why == "SL"
         label.new(bar_index, closePx, why + " " + f_sg(net, "0.00") + "%", style=label.style_label_left, color=color.new(color.black, 100), textcolor=net > 0 ? color.teal : color.red, size=size.tiny)
@@ -501,7 +513,10 @@ if barstate.isconfirmed
         pos   := buyEdge ? 1 : -1
         ePx   := close
         eBar  := bar_index
+        eTime := time
         risk  = slMult * atrV
+        sumFeeR += 2 * feePct / (risk / close * 100) * 100
+        nFeeR   += 1
         slPx  := close - pos * risk
         tp1   := close + pos * tp1R * risk
         tp2   := close + pos * tp2R * risk
@@ -553,14 +568,31 @@ f_num(x, fmt) =>
 f_col(x) =>
     na(x) ? color.white : x > 0 ? color.lime : x < 0 ? color.red : color.white
 
-var table tb = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 15), frame_color=color.gray, frame_width=1, border_width=1)
+// n işlem · isabet · net toplam · ortalama · kâr faktörü
+f_stat(n, w, sm, gw, gl) =>
+    n == 0 ? "İşlem yok" : str.tostring(n, "#") + " işlem · isabet %" + str.tostring(100 * w / n, "0.0") + " · net " + f_sg(sm, "0.00") + "% · ort. " + f_sg(sm / n, "0.000") + "% · PF " + (gl > 0 ? str.tostring(gw / gl, "0.00") : "-")
+
+// Test dönemi başlangıç çizgisi
+if time >= evalStart and time[1] < evalStart
+    line.new(bar_index, low, bar_index, high, extend=extend.both, color=color.new(color.yellow, 30), style=line.style_dashed)
+    label.new(bar_index, high, "Test dönemi →", yloc=yloc.abovebar, style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.yellow, size=size.small)
+
+var table tb = table.new(position.top_right, 2, 18, bgcolor=color.new(color.black, 15), frame_color=color.gray, frame_width=1, border_width=1)
 
 f_row(r, k, v, col) =>
     table.cell(tb, 0, r, k, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
     table.cell(tb, 1, r, v, text_color=col, text_size=size.small, text_halign=text.align_left)
 
 if showTable and barstate.islast
-    pf   = gLoss > 0 ? gWin / gLoss : na
+    tN  = stN.get(1) + stN.get(2)
+    tW  = stW.get(1) + stW.get(2)
+    tS  = stS.get(1) + stS.get(2)
+    tGW = stGW.get(1) + stGW.get(2)
+    tGL = stGL.get(1) + stGL.get(2)
+    tPF = tGL > 0 ? tGW / tGL : na
+    feeNow = atrV > 0 ? 2 * feePct / (slMult * atrV / close * 100) * 100 : na
+    feeAvg = nFeeR > 0 ? sumFeeR / nFeeR : na
+    feeBad = feeNow > feeWarn or feeAvg > feeWarn
     posT = pos == 0 ? "Yok" : (pos == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(ePx, format.mintick) + " · SL " + str.tostring(slPx, format.mintick) + " · TP " + str.tostring(tp1, format.mintick) + "/" + str.tostring(tp2, format.mintick) + "/" + str.tostring(tp3, format.mintick) + " (" + str.tostring(tpHit) + " alındı)"
     kInfo = wKnn == 0 ? "Kapalı" : na(knnS) ? "Hazır değil (" + str.tostring(KL.size()) + " örnek)" : f_sg(knnS, "0.00") + " (oy " + str.tostring(knnVote) + "/" + str.tostring(kNb) + ")"
     rInfo = wRidge == 0 ? "Kapalı" : not trained ? "Isınıyor: " + str.tostring(buf.size()) + "/" + str.tostring(trainW) + " bar" : f_sg(ridgeS, "0.00") + " (tahmin " + f_sg(predLast * 100, "0.000") + "%)"
@@ -572,12 +604,16 @@ if showTable and barstate.islast
     f_row(5, "Rejim", regOn ? f_regName(regime) + (regFullE ? " (tam)" : " (yalnız toksik)") : "Filtre kapalı", color.new(regCol, 0))
     f_row(6, "Kernel", (kUp ? "Yükseliyor" : kDn ? "Düşüyor" : "Yatay") + (kerOn ? " · filtre açık" : " · filtre kapalı"), kUp ? color.lime : color.red)
     f_row(7, "Pozisyon", posT, pos == 1 ? color.lime : pos == -1 ? color.red : color.white)
-    f_row(8, "İşlem / isabet", str.tostring(nTr) + " · " + (nTr > 0 ? str.tostring(100.0 * nWin / nTr, "0.0") + "%" : "-"), color.white)
-    f_row(9, "Net toplam / ortalama", f_sg(sumRet, "0.00") + "% / " + (nTr > 0 ? f_sg(sumRet / nTr, "0.000") + "%" : "-"), f_col(sumRet))
-    f_row(10, "Kâr faktörü / maks. DD", f_num(pf, "0.00") + " / " + str.tostring(maxDD, "0.00") + "%", color.white)
-    f_row(11, "kNN aralığı", kCalc == 0 ? "Tüm geçmiş" : "Son " + str.tostring(kCalc) + " bar (öncesinde sinyal yok)", color.white)
-    f_row(12, "Risk", "SL " + str.tostring(slMult, "0.0") + "×ATR · TP " + str.tostring(tp1R, "0.0") + "/" + str.tostring(tp2R, "0.0") + "/" + str.tostring(tp3R, "0.0") + "R · kom. %" + str.tostring(feePct, "0.00") + "×2", color.white)
-    f_row(13, "Not", "İstatistik: 1x, bileşik değil, aynı barda SL önce; backtest yerine geçmez", color.gray)
+    f_row(8, "Ayar dönemi (öncesi)", f_stat(stN.get(0), stW.get(0), stS.get(0), stGW.get(0), stGL.get(0)), f_col(stS.get(0)))
+    f_row(9, "Test dönemi (sonrası)", tN == 0 ? (time < evalStart ? "Test dönemi henüz başlamadı" : "İşlem yok") : f_stat(tN, tW, tS, tGW, tGL), f_col(tS))
+    f_row(10, "Test PF / maks. DD", f_num(tPF, "0.00") + " / " + str.tostring(ddT, "0.00") + "%", na(tPF) ? color.white : tPF >= 1.2 ? color.lime : tPF < 1 ? color.red : color.orange)
+    f_row(11, "Test long", f_stat(stN.get(1), stW.get(1), stS.get(1), stGW.get(1), stGL.get(1)), f_col(stS.get(1)))
+    f_row(12, "Test short", f_stat(stN.get(2), stW.get(2), stS.get(2), stGW.get(2), stGL.get(2)), f_col(stS.get(2)))
+    f_row(13, "Komisyon / 1R", "şu an %" + f_num(feeNow, "0") + " · işlemlerde ort. %" + f_num(feeAvg, "0"), feeBad ? color.orange : color.white)
+    f_row(14, "Uyarı", feeBad ? "Komisyon stop mesafesinin %" + str.tostring(feeWarn, "0") + "'ünü aşıyor: stop çok dar veya zaman dilimi çok küçük" : "-", feeBad ? color.orange : color.white)
+    f_row(15, "kNN aralığı", kCalc == 0 ? "Tüm geçmiş" : "Son " + str.tostring(kCalc) + " bar (öncesinde sinyal yok)", color.white)
+    f_row(16, "Risk", "SL " + str.tostring(slMult, "0.0") + "×ATR · TP " + str.tostring(tp1R, "0.0") + "/" + str.tostring(tp2R, "0.0") + "/" + str.tostring(tp3R, "0.0") + "R · kom. %" + str.tostring(feePct, "0.00") + "×2", color.white)
+    f_row(17, "Not", "İstatistik: 1x, bileşik değil, aynı barda SL önce; backtest yerine geçmez", color.gray)
 
 // ═════════════════════════════ NOTLAR ═════════════════════════════
 // YÖNTEM
@@ -592,6 +628,8 @@ if showTable and barstate.islast
 // - Ridge ilk eğitim penceresi dolana kadar hazır değildir (1H ≈ 4490 bar); ağırlığı 0 yapılırsa sinyaller daha erken başlar.
 // - kNN varsayılan olarak son 10000 barda hesaplanır ve sınır last_bar_index'e bağlıdır: grafik yeniden yüklendiğinde
 //   en eski sinyaller kayabilir. Zaman aşımı hatası alırsanız "Arama penceresi"ni düşürün veya "Örnek aralığı"nı artırın.
+// - Değerlendirme: ayarları "Test dönemi başlangıcı"ndan önceki dönemde seçin, yalnızca sonraki dönemin sonucuna güvenin.
+//   Test dönemine bakarak ayar değiştirirseniz o dönem de örneklem içi olur. Komisyon/1R = 2 × komisyon / stop mesafesi (%).
 // - İstatistik tablosu kaba bir tahmindir: giriş sinyal barının kapanışında, bar içi sıra bilinmez (SL önce varsayılır),
 //   kayma ve funding yok. Gerçek backtest için strateji sürümü gerekir.
 // - Klasik oylama ve kNN parametreleri bar cinsindendir (zaman dilimine göre ölçeklenmez).
