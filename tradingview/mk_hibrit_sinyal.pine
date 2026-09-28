@@ -1,0 +1,597 @@
+//@version=6
+indicator("MK Hibrit Sinyal", shorttitle="MK Hibrit", overlay=true, max_labels_count=500, max_lines_count=500, max_bars_back=5000)
+
+// Üç yaklaşımın birleşimi (kod kopyalanmadı, yöntemler yeniden uygulandı):
+//  1) Ridge regresyon getiri tahmini (MK Akıllı Sinyal)
+//  2) Lorentzian mesafeli kNN sınıflandırma – gelecek H bar yönü etiketiyle (Lorentzian Classification fikri, düzeltilmiş)
+//  3) Ağırlıklı klasik indikatör oylaması + ATR tabanlı SL / kademeli TP (Acrypto Weighted Strategy fikri)
+// Topluluk skoru [-1, 1]; eşiği aşınca sinyal. Tüm hesaplar kapanmış barda (repaint yok).
+
+// ═════════════════════════════ GİRDİLER ═════════════════════════════
+G_PRF = "Profil"
+G_ENS = "Topluluk ağırlıkları"
+G_RDG = "1) Ridge modeli"
+G_KNN = "2) kNN (Lorentzian)"
+G_CLS = "3) Klasik oylama"
+G_FLT = "Filtreler"
+G_RSK = "Risk yönetimi"
+G_TF  = "Zaman pencereleri (Ridge + rejim)"
+G_VIS = "Görünüm"
+
+profile  = input.string("Scalp – Agresif", "Profil", options=["Scalp – Agresif", "Dengeli", "Sıkı", "Özel"], group=G_PRF, tooltip="Scalp – Agresif: skor eşiği 0.30, λ=0.5, rejimde yalnız Toksik (>%97) engeller. Dengeli: 0.45, λ=1, karşı trend engellenir, Toksik >%95. Sıkı: 0.60, λ=2, Toksik >%90. Özel: '(Özel)' etiketli ayarlar.")
+entryIn  = input.float(0.5, "Skor giriş eşiği (Özel)", minval=0.05, maxval=1.0, step=0.05, group=G_PRF, tooltip="Topluluk skoru ≥ +eşik → AL, ≤ −eşik → SAT.")
+
+wRidge = input.float(1.0, "Ridge ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_ENS, tooltip="0 = bileşeni kapat.")
+wKnn   = input.float(1.0, "kNN ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_ENS, tooltip="0 = bileşeni kapat.")
+wCls   = input.float(1.0, "Klasik oylama ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_ENS, tooltip="0 = bileşeni kapat.")
+
+alpha = input.float(1.0, "Ridge α", minval=0.000001, group=G_RDG, tooltip="β = (XᵀX + αI)⁻¹Xᵀy, standartlaştırılmış özelliklerle.")
+costC = input.float(0.001, "Maliyet c", minval=0.0, step=0.0001, group=G_RDG, tooltip="Ridge bileşeninde tahmin λ·c ile ölçeklenir: |tahmin| ≥ λ·c → tam oy (±1).")
+lamIn = input.float(2.0, "λ (Özel)", minval=0.0, step=0.1, group=G_RDG, tooltip="Ridge ölçek eşiği = λ·c.")
+
+kNb      = input.int(8, "Komşu sayısı k", minval=3, maxval=50, group=G_KNN, tooltip="En yakın k örneğin etiketleri oylanır.")
+kH       = input.int(4, "Tahmin ufku (bar)", minval=1, maxval=50, group=G_KNN, tooltip="Etiket: H bar sonraki kapanış > bugünkü kapanış → +1. Etiket ancak H bar sonra bilinir (gelecek veri yok).")
+kWinIn   = input.int(1000, "Arama penceresi (örnek)", minval=100, maxval=5000, group=G_KNN, tooltip="Son kaç etiketli örnekte aranacağı.")
+kStride  = input.int(4, "Örnek aralığı", minval=1, maxval=20, group=G_KNN, tooltip="Her n. örneğe bakılır: hız + kronolojik çeşitlilik.")
+kCalc    = input.int(10000, "Yalnızca son N barda hesapla (0 = tümü)", minval=0, group=G_KNN, tooltip="Uzun grafiklerde zaman limitini aşmamak için. kNN açıkken sinyaller yalnızca bu aralıkta üretilir.")
+
+wMacd  = input.float(1.0, "MACD ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_CLS, tooltip="MACD > sinyal → +1, < → −1.")
+wSt    = input.float(1.0, "Supertrend ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_CLS, tooltip="Supertrend yönü.")
+wEma   = input.float(1.0, "EMA kesişim ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_CLS, tooltip="Hızlı EMA > yavaş EMA → +1.")
+wRsi   = input.float(1.0, "RSI ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_CLS, tooltip="RSI < aşırı satım → +1, > aşırı alım → −1, arada 0.")
+wSrsi  = input.float(1.0, "Stoch RSI ağırlığı", minval=0.0, maxval=5.0, step=0.5, group=G_CLS, tooltip="%K < alt → +1, > üst → −1, arada 0.")
+stFac  = input.float(3.0, "Supertrend çarpanı", minval=0.1, step=0.1, group=G_CLS, tooltip="ATR çarpanı.")
+stLen  = input.int(10, "Supertrend ATR", minval=1, group=G_CLS, tooltip="ATR uzunluğu.")
+emaFL  = input.int(21, "EMA hızlı", minval=1, group=G_CLS, tooltip="Hızlı EMA uzunluğu (bar).")
+emaSL  = input.int(55, "EMA yavaş", minval=2, group=G_CLS, tooltip="Yavaş EMA uzunluğu (bar).")
+rsiOB  = input.float(70, "RSI aşırı alım", group=G_CLS, tooltip="Üstü −1 oy.")
+rsiOS  = input.float(30, "RSI aşırı satım", group=G_CLS, tooltip="Altı +1 oy.")
+srOB   = input.float(80, "Stoch RSI üst", group=G_CLS, tooltip="Üstü −1 oy.")
+srOS   = input.float(20, "Stoch RSI alt", group=G_CLS, tooltip="Altı +1 oy.")
+
+regOn     = input.bool(true, "Rejim filtresi", group=G_FLT, tooltip="Toksik (aşırı volatil) rejimde sinyal yok; tam modda karşı trend sinyali de yok.")
+regFullIn = input.string("Tam", "Rejim katılığı (Özel)", options=["Yalnız toksik", "Tam"], group=G_FLT, tooltip="Tam: AL yalnız Trend-Yukarı/Yatay, SAT yalnız Trend-Aşağı/Yatay.")
+erThrIn   = input.float(0.30, "Verimlilik oranı eşiği (Özel)", minval=0.0, maxval=1.0, step=0.05, group=G_FLT, tooltip="ER > eşik → trend; yön EMA50/EMA200.")
+toxIn     = input.float(90.0, "Toksik vol yüzdeliği (Özel)", minval=0.0, maxval=100.0, group=G_FLT, tooltip="Vol yüzdeliği bunun üstünde → Toksik.")
+minRegIn  = input.int(3, "Rejim değişimi min. bar (Özel)", minval=1, group=G_FLT, tooltip="Yeni rejim bu kadar bar sürmeli.")
+kerOn     = input.bool(false, "Kernel eğim filtresi", group=G_FLT, tooltip="Nadaraya-Watson (rasyonel kuadratik) tahmini yükseliyorsa AL, düşüyorsa SAT'a izin.")
+kerH      = input.int(8, "Kernel bant genişliği", minval=1, group=G_FLT, tooltip="Büyük değer = daha düzgün eğri.")
+kerR      = input.float(8.0, "Kernel göreli ağırlık", minval=0.25, step=0.25, group=G_FLT, tooltip="Küçük değer uzak barlara daha çok ağırlık verir.")
+kerX      = input.int(25, "Kernel bar sayısı", minval=2, maxval=200, group=G_FLT, tooltip="Tahmine giren geçmiş bar sayısı.")
+
+slMult  = input.float(1.5, "Stop (ATR ×)", minval=0.1, step=0.1, group=G_RSK, tooltip="SL = giriş ∓ çarpan × ATR14. 1R = bu mesafe.")
+tp1R    = input.float(1.0, "TP1 (R)", minval=0.1, step=0.1, group=G_RSK, tooltip="Risk katı.")
+tp2R    = input.float(2.0, "TP2 (R)", minval=0.1, step=0.1, group=G_RSK, tooltip="Risk katı.")
+tp3R    = input.float(3.0, "TP3 (R)", minval=0.1, step=0.1, group=G_RSK, tooltip="Risk katı; kalan pozisyon burada kapanır.")
+q1In    = input.float(33, "TP1'de kapat (%)", minval=0, maxval=100, group=G_RSK, tooltip="Pozisyonun yüzdesi.")
+q2In    = input.float(33, "TP2'de kapat (%)", minval=0, maxval=100, group=G_RSK, tooltip="Pozisyonun yüzdesi; kalan TP3'te.")
+beOn    = input.bool(true, "TP1 sonrası stopu girişe çek", group=G_RSK, tooltip="Başa baş (BE) stop.")
+maxHold = input.int(0, "Maks. tutma (bar, 0 = kapalı)", minval=0, group=G_RSK, tooltip="Süre dolunca kapanışta çık.")
+revOn   = input.bool(true, "Ters sinyalde pozisyonu çevir", group=G_RSK, tooltip="Kapalıysa pozisyon yalnız SL/TP/süre ile kapanır.")
+feePct  = input.float(0.05, "Komisyon (%, taraf başı)", minval=0.0, step=0.01, group=G_RSK, tooltip="Giriş ve çıkışta ayrı ayrı düşülür (istatistik tablosu).")
+
+autoScale   = input.bool(true, "Otomatik ölçekleme", group=G_TF, tooltip="Süreler timeframe.in_seconds() ile bara çevrilir; kapalıyken 1H değerleri.")
+trainDays   = input.float(180.0, "Ridge eğitim penceresi (gün)", minval=0.1, group=G_TF, tooltip="Bar karşılığı [300, 5000].")
+retrainDays = input.float(7.0, "Yeniden eğitim (gün)", minval=0.01, group=G_TF, tooltip="Bar karşılığı [20, 500].")
+zDays       = input.float(7.0, "Hacim z-skoru (gün)", minval=0.01, group=G_TF, tooltip="Bar karşılığı [50, 2000].")
+smaLDays    = input.float(7.0, "SMA uzun (gün)", minval=0.01, group=G_TF, tooltip="Bar karşılığı [5, 2000].")
+smaSDays    = input.float(1.0, "SMA kısa (gün)", minval=0.01, group=G_TF, tooltip="Bar karşılığı [5, 2000].")
+volDays     = input.float(1.0, "Volatilite std (gün)", minval=0.01, group=G_TF, tooltip="Bar karşılığı [10, 500].")
+pctDays     = input.float(365.0, "Vol yüzdelik (gün)", minval=1.0, group=G_TF, tooltip="Bar karşılığı [200, 4999].")
+erDays      = input.float(2.0, "Verimlilik oranı (gün)", minval=0.01, group=G_TF, tooltip="Bar karşılığı [10, 500].")
+
+showTable = input.bool(true, "Tabloyu göster", group=G_VIS, tooltip="Skorlar, pozisyon ve performans.")
+showLvl   = input.bool(true, "SL/TP çizgileri", group=G_VIS, tooltip="Açık işlemin seviyeleri.")
+showKer   = input.bool(true, "Kernel çizgisi", group=G_VIS, tooltip="Nadaraya-Watson tahmini.")
+showBg    = input.bool(true, "Rejim arka planı", group=G_VIS, tooltip="Yeşil yukarı, kırmızı aşağı, gri yatay, mor toksik.")
+bgTransp  = input.int(90, "Arka plan saydamlığı", minval=0, maxval=100, group=G_VIS, tooltip="%.")
+barColOn  = input.bool(false, "Mumları skora göre renklendir", group=G_VIS, tooltip="Kırmızı −1 … yeşil +1.")
+lblSizeIn = input.string("Normal", "Etiket boyutu", options=["Küçük", "Normal", "Büyük"], group=G_VIS, tooltip="AL/SAT etiketleri.")
+
+// ═════════════════════════════ PROFİL ═════════════════════════════
+isAgr    = profile == "Scalp – Agresif"
+isBal    = profile == "Dengeli"
+isStr    = profile == "Sıkı"
+entryE   = isAgr ? 0.30 : isBal ? 0.45 : isStr ? 0.60 : entryIn
+lamE     = isAgr ? 0.5 : isBal ? 1.0 : isStr ? 2.0 : lamIn
+regFullE = isAgr ? false : isBal or isStr ? true : regFullIn == "Tam"
+erE      = isAgr or isBal or isStr ? 0.30 : erThrIn
+toxE     = isAgr ? 97.0 : isBal ? 95.0 : isStr ? 90.0 : toxIn
+minRegE  = isAgr ? 2 : isBal or isStr ? 3 : minRegIn
+thr      = lamE * costC
+q1       = q1In / 100
+q2       = math.min(q2In, 100 - q1In) / 100
+lblSize  = lblSizeIn == "Küçük" ? size.small : lblSizeIn == "Büyük" ? size.large : size.normal
+
+// ═════════════════════════════ PENCERELER ═════════════════════════════
+DAY  = 86400.0
+HOUR = 3600.0
+P    = 11
+
+tfSec = autoScale ? timeframe.in_seconds() : 3600
+
+f_bars(sec, lo, hi) =>
+    math.max(lo, math.min(hi, math.round(sec / tfSec)))
+
+trainW   = f_bars(trainDays * DAY, 300, 5000)
+retrainN = f_bars(retrainDays * DAY, 20, 500)
+zLen     = f_bars(zDays * DAY, 50, 2000)
+smaLLen  = f_bars(smaLDays * DAY, 5, 2000)
+smaSLen  = f_bars(smaSDays * DAY, 5, 2000)
+volLen   = f_bars(volDays * DAY, 10, 500)
+pctLen   = f_bars(pctDays * DAY, 200, 4999)
+erLen    = f_bars(erDays * DAY, 10, 500)
+a1 = f_bars(1 * HOUR, 1, 200)
+a2 = math.max(f_bars(3 * HOUR, 1, 200), a1 + 1)
+a3 = math.max(f_bars(6 * HOUR, 1, 200), a2 + 1)
+a4 = math.max(f_bars(12 * HOUR, 1, 200), a3 + 1)
+a5 = math.max(f_bars(24 * HOUR, 1, 200), a4 + 1)
+L5 = math.min(a5, 200)
+L4 = math.min(a4, L5 - 1)
+L3 = math.min(a3, L4 - 1)
+L2 = math.min(a2, L3 - 1)
+L1 = math.min(a1, L2 - 1)
+
+// ═════════════════════════════ ORTAK SERİLER ═════════════════════════════
+f_z(x, n) =>
+    m = ta.sma(x, n)
+    s = ta.stdev(x, n)
+    s > 0 ? (x - m) / s : na
+
+lc     = math.log(close)
+r1     = lc - lc[1]
+rsiV   = ta.rsi(close, 14)
+atrV   = ta.atr(14)
+volStd = ta.stdev(r1, volLen)
+smaS   = ta.sma(close, smaSLen)
+smaL   = ta.sma(close, smaLLen)
+volZ   = f_z(volume, zLen)
+
+erNoise = math.sum(math.abs(close - close[1]), erLen)
+er      = erNoise > 0 ? math.abs(close - close[erLen]) / erNoise : na
+emaF    = ta.ema(close, 50)
+emaS    = ta.ema(close, 200)
+volPct  = ta.percentrank(volStd, pctLen)
+
+// Ridge özellikleri
+fL1 = lc - lc[L1]
+fL2 = lc - lc[L2]
+fL3 = lc - lc[L3]
+fL4 = lc - lc[L4]
+fL5 = lc - lc[L5]
+fR  = (rsiV - 50) / 50
+fS  = close / smaS - 1
+fL  = close / smaL - 1
+fA  = atrV / close
+fVz = na(volume) ? 0.0 : volZ
+
+// kNN özellikleri: sınırlı [0, 1] osilatörler (her paritede aynı ölçek)
+[diP, diM, adxV] = ta.dmi(14, 14)
+cciV = ta.cci(close, 20)
+k1 = rsiV / 100
+k2 = ta.rsi(close, 9) / 100
+k3 = (math.max(-1.0, math.min(1.0, cciV / 200)) + 1) / 2
+k4 = adxV / 100
+k5 = er
+
+// Klasik oylama
+[macdL, sigL, histL] = ta.macd(close, 12, 26, 9)
+[stV, stDir] = ta.supertrend(stFac, stLen)
+emaA  = ta.ema(close, emaFL)
+emaB  = ta.ema(close, emaSL)
+srsiK = ta.sma(ta.stoch(rsiV, rsiV, rsiV, 14), 3)
+
+f_s(up, dn) =>
+    up ? 1.0 : dn ? -1.0 : 0.0
+
+f_sg(x, fmt) =>
+    na(x) ? "-" : (x > 0 ? "+" : "") + str.tostring(x, fmt)
+
+wClsSum = wMacd + wSt + wEma + wRsi + wSrsi
+clsReady = not na(sigL) and not na(stDir) and not na(emaB) and not na(srsiK)
+clsS = clsReady and wClsSum > 0 ? (wMacd * f_s(macdL > sigL, macdL < sigL) + wSt * f_s(stDir < 0, stDir > 0) + wEma * f_s(emaA > emaB, emaA < emaB) + wRsi * f_s(rsiV < rsiOS, rsiV > rsiOB) + wSrsi * f_s(srsiK < srOS, srsiK > srOB)) / wClsSum : na
+
+// Nadaraya-Watson rasyonel kuadratik kernel (yalnızca geçmiş barlar)
+f_kernel(src, h, r, n) =>
+    float num = 0.0
+    float den = 0.0
+    for i = 0 to n
+        w = math.pow(1 + (i * i) / (h * h * 2 * r), -r)
+        num += src[i] * w
+        den += w
+    num / den
+
+kEst = f_kernel(close, kerH, kerR, kerX)
+kUp  = kEst > kEst[1]
+kDn  = kEst < kEst[1]
+
+// ═════════════════════════════ DURUM ═════════════════════════════
+type Sample
+    array<float> x
+    float y
+
+// Ridge
+var array<Sample> buf = array.new<Sample>()
+var array<float> sx   = array.new_float(P, 0.0)
+var array<float> sxy  = array.new_float(P, 0.0)
+var array<float> sxx  = array.new_float(P * P, 0.0)
+var array<float> prevX = array.new_float(0)
+var array<float> mu   = array.new_float(P, 0.0)
+var array<float> sd   = array.new_float(P, 1.0)
+var array<float> beta = array.new_float(P, 0.0)
+var float sy = 0.0
+var float yBar = 0.0
+var bool trained = false
+var int sinceTrain = 0
+var float predLast = na
+
+// kNN
+var array<float> KF1 = array.new_float(0)
+var array<float> KF2 = array.new_float(0)
+var array<float> KF3 = array.new_float(0)
+var array<float> KF4 = array.new_float(0)
+var array<float> KF5 = array.new_float(0)
+var array<int>   KL  = array.new_int(0)
+var int knnVote = na
+
+// Rejim
+var int regime  = na
+var int regCand = na
+var int regCnt  = 0
+
+// Skor / pozisyon / istatistik
+var float ridgeS = na
+var float knnS   = na
+var float scoreL = na
+var bool prevBuy  = false
+var bool prevSell = false
+var int   pos    = 0
+var float ePx    = na
+var float slPx   = na
+var float tp1    = na
+var float tp2    = na
+var float tp3    = na
+var int   tpHit  = 0
+var int   eBar   = na
+var float remQ   = 0.0
+var float tRet   = 0.0
+var int   nTr    = 0
+var int   nWin   = 0
+var float sumRet = 0.0
+var float gWin   = 0.0
+var float gLoss  = 0.0
+var float peak   = 0.0
+var float maxDD  = 0.0
+var line lE  = na
+var line lS  = na
+var line lT1 = na
+var line lT2 = na
+var line lT3 = na
+
+bool buyEvent  = false
+bool sellEvent = false
+bool tpEvent   = false
+bool slEvent   = false
+bool exitEvent = false
+bool regChg    = false
+
+f_update(array<float> x, float y, float sgn) =>
+    for i = 0 to P - 1
+        xi = x.get(i)
+        sx.set(i, sx.get(i) + sgn * xi)
+        sxy.set(i, sxy.get(i) + sgn * xi * y)
+        for j = i to P - 1
+            k = i * P + j
+            sxx.set(k, sxx.get(k) + sgn * xi * x.get(j))
+
+// ═════════════════════════════ ANA HESAP (kapanmış bar) ═════════════════════════════
+if barstate.isconfirmed
+    // ---- 1) Ridge ----
+    xNow = array.from(fL1, fL2, fL3, fL4, fL5, fR, fS, fL, fA, volStd, fVz)
+    bool xOk = true
+    for i = 0 to P - 1
+        if na(xNow.get(i))
+            xOk := false
+    if prevX.size() == P and not na(r1)
+        f_update(prevX, r1, 1.0)
+        sy += r1
+        buf.push(Sample.new(prevX, r1))
+        if buf.size() > trainW
+            old = buf.shift()
+            f_update(old.x, old.y, -1.0)
+            sy -= old.y
+    prevX := xOk ? xNow : array.new_float(0)
+    if trained
+        sinceTrain += 1
+    if wRidge > 0 and buf.size() >= trainW and (not trained or sinceTrain >= retrainN)
+        n  = float(buf.size())
+        ym = sy / n
+        for i = 0 to P - 1
+            m  = sx.get(i) / n
+            vr = sxx.get(i * P + i) / n - m * m
+            mu.set(i, m)
+            sd.set(i, vr > 1e-14 ? math.sqrt(vr) : 1.0)
+        matrix<float> A = matrix.new<float>(P, P, 0.0)
+        array<float>  b = array.new_float(P, 0.0)
+        for i = 0 to P - 1
+            mi = mu.get(i)
+            si = sd.get(i)
+            b.set(i, (sxy.get(i) - n * mi * ym) / si)
+            for j = i to P - 1
+                val = (sxx.get(i * P + j) - n * mi * mu.get(j)) / (si * sd.get(j))
+                A.set(i, j, val)
+                A.set(j, i, val)
+        for i = 0 to P - 1
+            A.set(i, i, A.get(i, i) + alpha)
+        matrix<float> Ai = A.inv()
+        for i = 0 to P - 1
+            float bi = 0.0
+            for j = 0 to P - 1
+                bi += Ai.get(i, j) * b.get(j)
+            beta.set(i, bi)
+        yBar       := ym
+        trained    := true
+        sinceTrain := 0
+    if trained and xOk
+        float p_ = yBar
+        for i = 0 to P - 1
+            p_ += beta.get(i) * (xNow.get(i) - mu.get(i)) / sd.get(i)
+        predLast := p_
+        ridgeS   := thr > 0 ? math.max(-1.0, math.min(1.0, p_ / thr)) : math.sign(p_)
+    else
+        predLast := na
+        ridgeS   := na
+
+    // ---- 2) kNN: H bar önceki özellikler + artık bilinen etiket ----
+    if bar_index >= kH and not na(k1[kH]) and not na(k2[kH]) and not na(k3[kH]) and not na(k4[kH]) and not na(k5[kH])
+        KF1.push(k1[kH])
+        KF2.push(k2[kH])
+        KF3.push(k3[kH])
+        KF4.push(k4[kH])
+        KF5.push(k5[kH])
+        KL.push(close > close[kH] ? 1 : close < close[kH] ? -1 : 0)
+        if KL.size() > kWinIn
+            KF1.shift()
+            KF2.shift()
+            KF3.shift()
+            KF4.shift()
+            KF5.shift()
+            KL.shift()
+    knnS    := na
+    knnVote := na
+    bool kInRange = kCalc == 0 or bar_index >= last_bar_index - kCalc
+    if wKnn > 0 and kInRange and KL.size() >= kNb * kStride and not na(k1) and not na(k2) and not na(k3) and not na(k4) and not na(k5)
+        nd = array.new_float(kNb, 1e10)
+        nl = array.new_int(kNb, 0)
+        int j = KL.size() - 1
+        while j >= 0
+            d = math.log(1 + math.abs(k1 - KF1.get(j))) + math.log(1 + math.abs(k2 - KF2.get(j))) + math.log(1 + math.abs(k3 - KF3.get(j))) + math.log(1 + math.abs(k4 - KF4.get(j))) + math.log(1 + math.abs(k5 - KF5.get(j)))
+            int wi = 0
+            float wd = nd.get(0)
+            for q = 1 to kNb - 1
+                if nd.get(q) > wd
+                    wd := nd.get(q)
+                    wi := q
+            if d < wd
+                nd.set(wi, d)
+                nl.set(wi, KL.get(j))
+            j -= kStride
+        int v = 0
+        for q = 0 to kNb - 1
+            v += nl.get(q)
+        knnVote := v
+        knnS    := float(v) / kNb
+
+    // ---- Rejim: 0 Yatay, 1 Yukarı, 2 Aşağı, 3 Toksik ----
+    int rawReg = na
+    if not na(er) and not na(emaS)
+        bool toxic = not na(volPct) and volPct > toxE
+        rawReg := toxic ? 3 : er > erE and emaF > emaS ? 1 : er > erE and emaF < emaS ? 2 : 0
+    if not na(rawReg)
+        if na(regime)
+            regime := rawReg
+        else if rawReg == regime
+            regCand := na
+            regCnt  := 0
+        else
+            if not na(regCand) and rawReg == regCand
+                regCnt += 1
+            else
+                regCand := rawReg
+                regCnt  := 1
+            if regCnt >= minRegE
+                regime  := rawReg
+                regCand := na
+                regCnt  := 0
+                regChg  := true
+
+    // ---- Topluluk skoru (etkin tüm bileşenler hazır olmalı) ----
+    float num = 0.0
+    float den = 0.0
+    bool ready = true
+    if wRidge > 0
+        if na(ridgeS)
+            ready := false
+        else
+            num += wRidge * ridgeS
+            den += wRidge
+    if wKnn > 0
+        if na(knnS)
+            ready := false
+        else
+            num += wKnn * knnS
+            den += wKnn
+    if wCls > 0
+        if na(clsS)
+            ready := false
+        else
+            num += wCls * clsS
+            den += wCls
+    scoreL := ready and den > 0 ? num / den : na
+
+    bool regBuy  = not regOn or (not na(regime) and regime != 3 and (not regFullE or regime != 2))
+    bool regSell = not regOn or (not na(regime) and regime != 3 and (not regFullE or regime != 1))
+    bool buyOk   = not na(scoreL) and scoreL >= entryE and regBuy and (not kerOn or kUp)
+    bool sellOk  = not na(scoreL) and scoreL <= -entryE and regSell and (not kerOn or kDn)
+    bool buyEdge  = buyOk and not prevBuy
+    bool sellEdge = sellOk and not prevSell
+    prevBuy  := buyOk
+    prevSell := sellOk
+
+    // ---- Açık pozisyonun çıkışları (aynı barda SL ve TP → önce SL varsayılır) ----
+    float closePx = na
+    string why = ""
+    if pos != 0 and bar_index > eBar
+        if (pos == 1 and low <= slPx) or (pos == -1 and high >= slPx)
+            closePx := slPx
+            why     := slPx == ePx ? "BE" : "SL"
+        else
+            if tpHit == 0 and (pos == 1 ? high >= tp1 : low <= tp1)
+                tRet  += q1 * pos * (tp1 / ePx - 1) * 100
+                remQ  -= q1
+                tpHit := 1
+                tpEvent := true
+                label.new(bar_index, tp1, "TP1", style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.teal, size=size.tiny)
+                if beOn
+                    slPx := ePx
+                    if showLvl
+                        lS.set_x2(bar_index)
+                        lS := line.new(bar_index, ePx, bar_index + 1, ePx, color=color.orange, style=line.style_dashed)
+            if tpHit == 1 and (pos == 1 ? high >= tp2 : low <= tp2)
+                tRet  += q2 * pos * (tp2 / ePx - 1) * 100
+                remQ  -= q2
+                tpHit := 2
+                tpEvent := true
+                label.new(bar_index, tp2, "TP2", style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.teal, size=size.tiny)
+            if tpHit == 2 and (pos == 1 ? high >= tp3 : low <= tp3)
+                closePx := tp3
+                why     := "TP3"
+                tpEvent := true
+        if na(closePx) and maxHold > 0 and bar_index - eBar >= maxHold
+            closePx := close
+            why     := "Süre"
+    if pos != 0 and na(closePx) and revOn and ((pos == 1 and sellEdge) or (pos == -1 and buyEdge))
+        closePx := close
+        why     := "Ters"
+    if not na(closePx)
+        tRet += remQ * pos * (closePx / ePx - 1) * 100
+        net = tRet - 2 * feePct
+        nTr    += 1
+        sumRet += net
+        if net > 0
+            nWin += 1
+            gWin += net
+        else
+            gLoss -= net
+        peak  := math.max(peak, sumRet)
+        maxDD := math.max(maxDD, peak - sumRet)
+        exitEvent := true
+        slEvent   := why == "SL"
+        label.new(bar_index, closePx, why + " " + f_sg(net, "0.00") + "%", style=label.style_label_left, color=color.new(color.black, 100), textcolor=net > 0 ? color.teal : color.red, size=size.tiny)
+        if showLvl
+            lE.set_x2(bar_index)
+            lS.set_x2(bar_index)
+            lT1.set_x2(bar_index)
+            lT2.set_x2(bar_index)
+            lT3.set_x2(bar_index)
+        pos := 0
+
+    // ---- Yeni giriş (yalnızca sinyalin başladığı barda) ----
+    if pos == 0 and (buyEdge or sellEdge) and atrV > 0
+        pos   := buyEdge ? 1 : -1
+        ePx   := close
+        eBar  := bar_index
+        risk  = slMult * atrV
+        slPx  := close - pos * risk
+        tp1   := close + pos * tp1R * risk
+        tp2   := close + pos * tp2R * risk
+        tp3   := close + pos * tp3R * risk
+        tpHit := 0
+        remQ  := 1.0
+        tRet  := 0.0
+        buyEvent  := pos == 1
+        sellEvent := pos == -1
+        if pos == 1
+            label.new(bar_index, low, "AL " + str.tostring(scoreL, "0.00"), yloc=yloc.belowbar, color=color.green, style=label.style_triangleup, textcolor=color.green, size=lblSize)
+        else
+            label.new(bar_index, high, "SAT " + str.tostring(scoreL, "0.00"), yloc=yloc.abovebar, color=color.red, style=label.style_triangledown, textcolor=color.red, size=lblSize)
+        if showLvl
+            lE  := line.new(bar_index, ePx, bar_index + 1, ePx, color=color.gray)
+            lS  := line.new(bar_index, slPx, bar_index + 1, slPx, color=color.red)
+            lT1 := line.new(bar_index, tp1, bar_index + 1, tp1, color=color.teal, style=line.style_dotted)
+            lT2 := line.new(bar_index, tp2, bar_index + 1, tp2, color=color.teal, style=line.style_dotted)
+            lT3 := line.new(bar_index, tp3, bar_index + 1, tp3, color=color.teal)
+    else if pos != 0 and showLvl
+        lE.set_x2(bar_index + 1)
+        lS.set_x2(bar_index + 1)
+        lT1.set_x2(bar_index + 1)
+        lT2.set_x2(bar_index + 1)
+        lT3.set_x2(bar_index + 1)
+
+// ═════════════════════════════ ÇIKTILAR ═════════════════════════════
+regCol = regime == 1 ? color.green : regime == 2 ? color.red : regime == 3 ? color.purple : color.gray
+bgcolor(showBg and regOn and not na(regime) ? color.new(regCol, bgTransp) : na, title="Rejim")
+plot(showKer ? kEst : na, "Kernel", color=kUp ? color.teal : color.red, linewidth=2)
+barcolor(barColOn and not na(scoreL) ? color.from_gradient(scoreL, -1, 1, color.red, color.green) : na)
+plot(pos != 0 ? slPx : na, "SL", display=display.none)
+plot(pos != 0 ? tp1 : na, "TP1", display=display.none)
+plot(scoreL, "Skor", display=display.none)
+
+alertcondition(buyEvent, "MK Hibrit AL", 'MK Hibrit AL | {{ticker}} | Fiyat: {{close}} | SL: {{plot("SL")}} | TP1: {{plot("TP1")}}')
+alertcondition(sellEvent, "MK Hibrit SAT", 'MK Hibrit SAT | {{ticker}} | Fiyat: {{close}} | SL: {{plot("SL")}} | TP1: {{plot("TP1")}}')
+alertcondition(tpEvent, "MK Hibrit TP", "MK Hibrit TP | {{ticker}} | Fiyat: {{close}}")
+alertcondition(slEvent, "MK Hibrit SL", "MK Hibrit SL | {{ticker}} | Fiyat: {{close}}")
+alertcondition(exitEvent, "MK Hibrit Çıkış", "MK Hibrit pozisyon kapandı | {{ticker}} | Fiyat: {{close}}")
+alertcondition(regChg, "MK Hibrit rejim değişti", 'MK Hibrit rejim değişti | {{ticker}} | Fiyat: {{close}}')
+
+f_regName(r) =>
+    na(r) ? "Veri yetersiz" : r == 1 ? "Trend-Yukarı" : r == 2 ? "Trend-Aşağı" : r == 3 ? "Toksik" : "Yatay"
+
+f_num(x, fmt) =>
+    na(x) ? "-" : str.tostring(x, fmt)
+
+f_col(x) =>
+    na(x) ? color.white : x > 0 ? color.lime : x < 0 ? color.red : color.white
+
+var table tb = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 15), frame_color=color.gray, frame_width=1, border_width=1)
+
+f_row(r, k, v, col) =>
+    table.cell(tb, 0, r, k, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, r, v, text_color=col, text_size=size.small, text_halign=text.align_left)
+
+if showTable and barstate.islast
+    pf   = gLoss > 0 ? gWin / gLoss : na
+    posT = pos == 0 ? "Yok" : (pos == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(ePx, format.mintick) + " · SL " + str.tostring(slPx, format.mintick) + " · TP " + str.tostring(tp1, format.mintick) + "/" + str.tostring(tp2, format.mintick) + "/" + str.tostring(tp3, format.mintick) + " (" + str.tostring(tpHit) + " alındı)"
+    kInfo = wKnn == 0 ? "Kapalı" : na(knnS) ? "Hazır değil (" + str.tostring(KL.size()) + " örnek)" : f_sg(knnS, "0.00") + " (oy " + str.tostring(knnVote) + "/" + str.tostring(kNb) + ")"
+    rInfo = wRidge == 0 ? "Kapalı" : not trained ? "Isınıyor: " + str.tostring(buf.size()) + "/" + str.tostring(trainW) + " bar" : f_sg(ridgeS, "0.00") + " (tahmin " + f_sg(predLast * 100, "0.000") + "%)"
+    f_row(0, "MK Hibrit", "TF " + timeframe.period + " · " + profile + " · giriş ±" + str.tostring(entryE, "0.00"), color.white)
+    f_row(1, "Topluluk skoru", f_sg(scoreL, "0.00"), f_col(scoreL))
+    f_row(2, "1) Ridge", rInfo, f_col(ridgeS))
+    f_row(3, "2) kNN", kInfo, f_col(knnS))
+    f_row(4, "3) Klasik oylama", wCls == 0 ? "Kapalı" : f_sg(clsS, "0.00"), f_col(clsS))
+    f_row(5, "Rejim", regOn ? f_regName(regime) + (regFullE ? " (tam)" : " (yalnız toksik)") : "Filtre kapalı", color.new(regCol, 0))
+    f_row(6, "Kernel", (kUp ? "Yükseliyor" : kDn ? "Düşüyor" : "Yatay") + (kerOn ? " · filtre açık" : " · filtre kapalı"), kUp ? color.lime : color.red)
+    f_row(7, "Pozisyon", posT, pos == 1 ? color.lime : pos == -1 ? color.red : color.white)
+    f_row(8, "İşlem / isabet", str.tostring(nTr) + " · " + (nTr > 0 ? str.tostring(100.0 * nWin / nTr, "0.0") + "%" : "-"), color.white)
+    f_row(9, "Net toplam / ortalama", f_sg(sumRet, "0.00") + "% / " + (nTr > 0 ? f_sg(sumRet / nTr, "0.000") + "%" : "-"), f_col(sumRet))
+    f_row(10, "Kâr faktörü / maks. DD", f_num(pf, "0.00") + " / " + str.tostring(maxDD, "0.00") + "%", color.white)
+    f_row(11, "kNN aralığı", kCalc == 0 ? "Tüm geçmiş" : "Son " + str.tostring(kCalc) + " bar (öncesinde sinyal yok)", color.white)
+    f_row(12, "Risk", "SL " + str.tostring(slMult, "0.0") + "×ATR · TP " + str.tostring(tp1R, "0.0") + "/" + str.tostring(tp2R, "0.0") + "/" + str.tostring(tp3R, "0.0") + "R · kom. %" + str.tostring(feePct, "0.00") + "×2", color.white)
+    f_row(13, "Not", "İstatistik: 1x, bileşik değil, aynı barda SL önce; backtest yerine geçmez", color.gray)
+
+// ═════════════════════════════ NOTLAR ═════════════════════════════
+// YÖNTEM
+// - Skor = (wR·Ridge + wK·kNN + wC·Klasik) / (wR + wK + wC), her bileşen [-1, 1]. Ağırlığı 0 olan bileşen hesaba girmez;
+//   ağırlığı > 0 olan bileşen hazır değilse sinyal üretilmez.
+// - Ridge: sonraki bar log getirisi; ±λ·c'de tam oy. kNN: 5 sınırlı osilatör (RSI14, RSI9, CCI20, ADX14, verimlilik oranı),
+//   Lorentzian mesafe Σ log(1+|Δ|), gerçek en yakın k komşu, etiket = H bar sonraki yön (yalnız etiketi bilinen örnekler).
+//   Klasik: MACD, Supertrend, EMA kesişimi, RSI, Stoch RSI ağırlıklı oyu.
+// - Giriş: skor eşiği ilk aştığı barın kapanışında. Çıkış: SL (ATR), TP1/TP2 kısmi, TP3 kalan, BE stop, süre, ters sinyal.
+//
+// BİLİNEN SINIRLAMALAR
+// - Ridge ilk eğitim penceresi dolana kadar hazır değildir (1H ≈ 4490 bar); ağırlığı 0 yapılırsa sinyaller daha erken başlar.
+// - kNN varsayılan olarak son 10000 barda hesaplanır ve sınır last_bar_index'e bağlıdır: grafik yeniden yüklendiğinde
+//   en eski sinyaller kayabilir. Zaman aşımı hatası alırsanız "Arama penceresi"ni düşürün veya "Örnek aralığı"nı artırın.
+// - İstatistik tablosu kaba bir tahmindir: giriş sinyal barının kapanışında, bar içi sıra bilinmez (SL önce varsayılır),
+//   kayma ve funding yok. Gerçek backtest için strateji sürümü gerekir.
+// - Klasik oylama ve kNN parametreleri bar cinsindendir (zaman dilimine göre ölçeklenmez).
