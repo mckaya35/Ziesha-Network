@@ -2,12 +2,16 @@
 indicator("MK Akıllı Sinyal", shorttitle="MK Sinyal", overlay=true, max_labels_count=500, max_bars_back=5000)
 
 // ═════════════════════════════ GİRDİLER ═════════════════════════════
+G_PRF = "Sinyal profili"
 G_TF  = "Zaman pencereleri"
 G_MDL = "Modül 1 – Getiri tahmini"
 G_REG = "Modül 2 – Rejim filtresi"
 G_OF  = "Modül 3 – Order flow"
 G_CR  = "Modül 4 – Futures kalabalık"
 G_VIS = "Görünüm"
+
+profile     = input.string("Scalp – Agresif", "Profil", options=["Scalp – Agresif", "Dengeli", "Sıkı", "Özel"], group=G_PRF, tooltip="Scalp – Agresif: λ=0.5, rejimde yalnız Toksik (vol > %97) engeller, OF bandı 1.0, prim eşiği 3. Dengeli: λ=1, tam rejim kuralı, Toksik > %95, OF bandı 0.5, prim eşiği 2.5. Sıkı: orijinal kurallar (λ=2). Özel: '(Özel)' etiketli ayarlar kullanılır.")
+reentryBars = input.int(10, "Aynı yönde tekrar sinyal aralığı (bar)", minval=0, group=G_PRF, tooltip="0: yalnızca yön değiştiğinde ok. >0: aynı yönde son oktan en az bu kadar bar sonra yeni ok çizilebilir (scalp yeniden giriş).")
 
 autoScale   = input.bool(true, "Otomatik ölçekleme", group=G_TF, tooltip="Açık: süreler timeframe.in_seconds() ile bar sayısına çevrilir. Kapalı: 1H için geçerli bar değerleri (süre/1 saat) doğrudan kullanılır.")
 trainDays   = input.float(180.0, "Eğitim penceresi (gün)", minval=0.1, group=G_TF, tooltip="Ridge modelinin eğitildiği kayan pencere. Bar karşılığı [300, 5000] aralığına sıkıştırılır.")
@@ -26,24 +30,39 @@ lagH5       = input.float(24.0, "Getiri gecikmesi 5 (saat)", minval=0.01, group=
 
 alpha = input.float(1.0, "Ridge α", minval=0.000001, group=G_MDL, tooltip="β = (XᵀX + αI)⁻¹Xᵀy. Standartlaştırılmış özelliklerde XᵀX köşegeni ≈ pencere uzunluğu olduğundan α=1 zayıf bir cezadır.")
 costC = input.float(0.001, "İşlem maliyeti c", minval=0.0, step=0.0001, group=G_MDL, tooltip="Pozisyon değişimi başına maliyet (0.001 = %0.1). Zaman diliminden bağımsızdır.")
-lam   = input.float(2.0, "λ (eşik çarpanı)", minval=0.0, step=0.1, group=G_MDL, tooltip="Eşik = λ·c. |tahmin| eşiği aşmazsa sinyal BEKLE.")
+lam   = input.float(2.0, "λ (eşik çarpanı, Özel)", minval=0.0, step=0.1, group=G_MDL, tooltip="Eşik = λ·c. |tahmin| eşiği aşmazsa sinyal BEKLE.")
 
 regOn      = input.bool(true, "Rejim filtresini kullan", group=G_REG, tooltip="AL yalnızca Trend-Yukarı/Yatay, SAT yalnızca Trend-Aşağı/Yatay rejimde. Toksik rejimde sinyal yok.")
-erThr      = input.float(0.30, "Verimlilik oranı eşiği", minval=0.0, maxval=1.0, step=0.05, group=G_REG, tooltip="ER bu değerin üzerindeyse trend kabul edilir; yön EMA50/EMA200 ile belirlenir.")
-toxPct     = input.float(90.0, "Toksik volatilite yüzdeliği", minval=0.0, maxval=100.0, group=G_REG, tooltip="Volatilite yüzdelik sırası bunun üzerindeyse rejim Toksik.")
-minRegBars = input.int(3, "Rejim değişimi için min. bar", minval=1, group=G_REG, tooltip="Yeni rejim bu kadar ardışık bar sürmeden kabul edilmez.")
+erThr      = input.float(0.30, "Verimlilik oranı eşiği (Özel)", minval=0.0, maxval=1.0, step=0.05, group=G_REG, tooltip="ER bu değerin üzerindeyse trend kabul edilir; yön EMA50/EMA200 ile belirlenir.")
+toxPct     = input.float(90.0, "Toksik volatilite yüzdeliği (Özel)", minval=0.0, maxval=100.0, group=G_REG, tooltip="Volatilite yüzdelik sırası bunun üzerindeyse rejim Toksik.")
+minRegBars = input.int(3, "Rejim değişimi için min. bar (Özel)", minval=1, group=G_REG, tooltip="Yeni rejim bu kadar ardışık bar sürmeden kabul edilmez.")
+regStrictIn = input.string("Tam (orijinal)", "Rejim katılığı (Özel)", options=["Yalnız toksik", "Tam (orijinal)"], group=G_REG, tooltip="Yalnız toksik: sadece Toksik rejim engeller. Tam: AL yalnız Trend-Yukarı/Yatay, SAT yalnız Trend-Aşağı/Yatay; Toksik'te sinyal yok.")
 bgTransp   = input.int(88, "Arka plan saydamlığı (%)", minval=0, maxval=100, group=G_REG, tooltip="Rejim arka plan renginin saydamlığı.")
 
 ofOn   = input.bool(false, "Order flow teyidini kullan", group=G_OF, tooltip="AL için delta z > 0, SAT için delta z < 0 şartı. Alt TF verisi yoksa modül atlanır.")
+ofBandIn = input.float(0.0, "Tolerans bandı (Özel)", minval=0.0, step=0.1, group=G_OF, tooltip="AL, delta z > −bant iken; SAT, delta z < +bant iken geçer. 0 = orijinal (işaret şartı).")
 ofTfIn = input.string("Otomatik", "Alt zaman dilimi", options=["Otomatik", "1", "3", "5", "15", "30", "60", "120", "240", "1D"], group=G_OF, tooltip="Otomatik: grafik barı başına ~12 alt mum. Alt dilim grafikten küçük olmalı; değilse modül atlanır.")
 
 crOn    = input.bool(false, "Kalabalık filtresini kullan", group=G_CR, tooltip="Prim z > +eşik iken AL, prim z < −eşik iken SAT verilmez. Veri yoksa modül atlanır.")
-perpSym = input.symbol("BINANCE:BTCUSDT.P", "Perpetual sembol", group=G_CR, tooltip="Primin hesaplandığı vadeli sembol.")
-spotSym = input.symbol("BINANCE:BTCUSDT", "Spot sembol", group=G_CR, tooltip="Primin hesaplandığı spot sembol.")
-crThr   = input.float(2.0, "Prim z eşiği", minval=0.0, step=0.1, group=G_CR, tooltip="Prim = (perp−spot)/spot×100; z-skoru bu eşiği aşınca ilgili yön engellenir.")
+crAuto  = input.bool(true, "Sembolleri grafikten otomatik bul", group=G_CR, tooltip="Grafik sembolünden perp (XXXUSDT.P) ve spot (XXXUSDT) aynı borsada türetilir. 1000PEPE gibi 10^k çarpanlı kontratlarda çarpan atılır (z-skoru sabit çarpandan etkilenmez). Kapalıysa aşağıdaki semboller kullanılır.")
+perpSym = input.symbol("BINANCE:BTCUSDT.P", "Perpetual sembol (manuel)", group=G_CR, tooltip="Primin hesaplandığı vadeli sembol.")
+spotSym = input.symbol("BINANCE:BTCUSDT", "Spot sembol (manuel)", group=G_CR, tooltip="Primin hesaplandığı spot sembol.")
+crThr   = input.float(2.0, "Prim z eşiği (Özel)", minval=0.0, step=0.1, group=G_CR, tooltip="Prim = (perp−spot)/spot×100; z-skoru bu eşiği aşınca ilgili yön engellenir.")
 
 showTable = input.bool(true, "Bilgi tablosunu göster", group=G_VIS, tooltip="Sağ üstte durum tablosu.")
 lblSizeIn = input.string("Normal", "Etiket boyutu", options=["Küçük", "Normal", "Büyük"], group=G_VIS, tooltip="AL/SAT etiketlerinin boyutu.")
+
+// ═════════════════════════════ PROFİL ═════════════════════════════
+isAgr   = profile == "Scalp – Agresif"
+isBal   = profile == "Dengeli"
+isStr   = profile == "Sıkı"
+lamE    = isAgr ? 0.5 : isBal ? 1.0 : isStr ? 2.0 : lam
+erE     = isAgr or isBal or isStr ? 0.30 : erThr
+toxE    = isAgr ? 97.0 : isBal ? 95.0 : isStr ? 90.0 : toxPct
+minRegE = isAgr ? 2 : isBal or isStr ? 3 : minRegBars
+regFull = isAgr ? false : isBal or isStr ? true : regStrictIn == "Tam (orijinal)"
+ofBandE = isAgr ? 1.0 : isBal ? 0.5 : isStr ? 0.0 : ofBandIn
+crThrE  = isAgr ? 3.0 : isBal ? 2.5 : isStr ? 2.0 : crThr
 
 // ═════════════════════════════ PENCERELER ═════════════════════════════
 DAY  = 86400.0
@@ -144,8 +163,16 @@ ofZ     = f_z(ofRatio, zLen)
 ofAvail = ltfOk and not na(ofZ)
 
 // ═════════════════════════════ FUTURES PRİMİ ═════════════════════════════
-perpC   = request.security(perpSym, timeframe.period, close[1], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
-spotC   = request.security(spotSym, timeframe.period, close[1], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+// Otomatik: 1000PEPEUSDT.P → perp 1000PEPEUSDT.P, spot PEPEUSDT (aynı borsa). 1INCH gibi adlar korunur (yalnız 10^k, k≥3 atılır).
+tkr      = syminfo.ticker
+tkBase   = str.endswith(tkr, ".P") ? str.substring(tkr, 0, str.length(tkr) - 2) : tkr
+tkMult   = str.match(tkBase, "^10{3,}")
+spotBase = tkMult != "" and str.length(tkMult) < str.length(tkBase) ? str.substring(tkBase, str.length(tkMult)) : tkBase
+perpUse  = crAuto ? syminfo.prefix + ":" + tkBase + ".P" : perpSym
+spotUse  = crAuto ? syminfo.prefix + ":" + spotBase : spotSym
+
+perpC   = request.security(perpUse, timeframe.period, close[1], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+spotC   = request.security(spotUse, timeframe.period, close[1], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
 prem    = spotC > 0 ? (perpC - spotC) / spotC * 100 : na
 premZ   = f_z(prem, zLen)
 crAvail = not na(premZ)
@@ -188,6 +215,7 @@ var int regCand   = na
 var int regCnt    = 0
 var int lastSig   = 0
 var int lastSigT  = na
+var int lastSigBar = na
 var int rawN      = 0 // tanı sayaçları (yüklü geçmiş)
 var int blkReg    = 0
 var int blkOf     = 0
@@ -197,7 +225,7 @@ var int evN       = 0
 bool buyEvent     = false
 bool sellEvent    = false
 bool regChanged   = false
-thr     = lam * costC
+thr     = lamE * costC
 lblSize = lblSizeIn == "Küçük" ? size.small : lblSizeIn == "Büyük" ? size.large : size.normal
 
 if barstate.isconfirmed
@@ -265,8 +293,8 @@ if barstate.isconfirmed
     // Rejim: 0 Yatay, 1 Trend-Yukarı, 2 Trend-Aşağı, 3 Toksik
     int rawReg = na
     if not na(er) and not na(emaS)
-        bool toxic = not na(volPct) and volPct > toxPct
-        rawReg := toxic ? 3 : er > erThr and emaF > emaS ? 1 : er > erThr and emaF < emaS ? 2 : 0
+        bool toxic = not na(volPct) and volPct > toxE
+        rawReg := toxic ? 3 : er > erE and emaF > emaS ? 1 : er > erE and emaF < emaS ? 2 : 0
     if not na(rawReg)
         if na(regime)
             regime := rawReg
@@ -279,7 +307,7 @@ if barstate.isconfirmed
             else
                 regCand := rawReg
                 regCnt  := 1
-            if regCnt >= minRegBars
+            if regCnt >= minRegE
                 regime     := rawReg
                 regCand    := na
                 regCnt     := 0
@@ -289,12 +317,15 @@ if barstate.isconfirmed
     int rawDir = 0
     if trained and not na(predLast)
         rawDir := predLast > thr ? 1 : predLast < -thr ? -1 : 0
-    bool regBuy  = not regOn or (not na(regime) and (regime == 1 or regime == 0))
-    bool regSell = not regOn or (not na(regime) and (regime == 2 or regime == 0))
-    bool ofBuy   = not ofOn or not ofAvail or ofZ > 0
-    bool ofSell  = not ofOn or not ofAvail or ofZ < 0
-    bool crBuy   = not crOn or not crAvail or premZ <= crThr
-    bool crSell  = not crOn or not crAvail or premZ >= -crThr
+    // Toksik her profilde engeller; tam modda karşı trend de engellenir
+    bool regBuy  = not regOn or (not na(regime) and regime != 3 and (not regFull or regime != 2))
+    bool regSell = not regOn or (not na(regime) and regime != 3 and (not regFull or regime != 1))
+    bool ofBuy   = not ofOn or not ofAvail or ofZ > -ofBandE
+    bool ofSell  = not ofOn or not ofAvail or ofZ < ofBandE
+    bool crBuy   = not crOn or not crAvail or premZ <= crThrE
+    bool crSell  = not crOn or not crAvail or premZ >= -crThrE
+    bool reBuy   = lastSig != 1 or (reentryBars > 0 and bar_index - lastSigBar >= reentryBars)
+    bool reSell  = lastSig != -1 or (reentryBars > 0 and bar_index - lastSigBar >= reentryBars)
 
     // Tanı: ham sinyali ilk engelleyen neden
     if rawDir != 0
@@ -305,20 +336,22 @@ if barstate.isconfirmed
             blkOf += 1
         else if not (rawDir == 1 ? crBuy : crSell)
             blkCr += 1
-        else if lastSig == rawDir
+        else if not (rawDir == 1 ? reBuy : reSell)
             sameDir += 1
         else
             evN += 1
 
-    if rawDir == 1 and regBuy and ofBuy and crBuy and lastSig != 1
-        buyEvent := true
-        lastSig  := 1
-        lastSigT := time
+    if rawDir == 1 and regBuy and ofBuy and crBuy and reBuy
+        buyEvent   := true
+        lastSig    := 1
+        lastSigT   := time
+        lastSigBar := bar_index
         label.new(bar_index, low, "AL", yloc=yloc.belowbar, color=color.green, style=label.style_triangleup, textcolor=color.green, size=lblSize)
-    else if rawDir == -1 and regSell and ofSell and crSell and lastSig != -1
-        sellEvent := true
-        lastSig   := -1
-        lastSigT  := time
+    else if rawDir == -1 and regSell and ofSell and crSell and reSell
+        sellEvent  := true
+        lastSig    := -1
+        lastSigT   := time
+        lastSigBar := bar_index
         label.new(bar_index, high, "SAT", yloc=yloc.abovebar, color=color.red, style=label.style_triangledown, textcolor=color.red, size=lblSize)
 
 // ═════════════════════════════ ÇIKTILAR ═════════════════════════════
@@ -346,9 +379,9 @@ if showTable and barstate.islast
     mv    = trained ? avgMove : buf.size() > 0 ? sAbs / buf.size() : na
     ratio = mv > 0 ? thr / mv : na
     ofTxt = (ofOn ? "Açık" : "Kapalı") + " · " + (ltfWanted == "" and ofTfIn == "Otomatik" ? "1m'de order flow yok (atlandı)" : not ltfOk ? "Alt TF grafikten küçük değil (atlandı)" : ofAvail ? ltfUse + " · z=" + str.tostring(ofZ, "0.00") : "Veri yok (atlandı)")
-    crTxt = (crOn ? "Açık" : "Kapalı") + " · " + (crAvail ? "Prim z=" + str.tostring(premZ, "0.00") : "Veri yok (atlandı)")
+    crTxt = (crOn ? "Açık" : "Kapalı") + " · " + (crAvail ? spotUse + " · prim z=" + str.tostring(premZ, "0.00") : "Perp/spot verisi yok (atlandı)")
     sigTxt = lastSig == 1 ? "AL · " + f_date(lastSigT) : lastSig == -1 ? "SAT · " + f_date(lastSigT) : "-"
-    f_row(0, "MK Akıllı Sinyal", "TF " + timeframe.period + (autoScale ? " · otomatik ölçek" : " · 1H bar değerleri"), color.white)
+    f_row(0, "MK Akıllı Sinyal", "TF " + timeframe.period + " · " + profile + " · λ=" + str.tostring(lamE) + (autoScale ? "" : " · 1H bar değerleri"), color.white)
     f_row(1, "Son sinyal", sigTxt, lastSig == 1 ? color.lime : lastSig == -1 ? color.red : color.white)
     f_row(2, "Rejim", regOn ? f_regName(regime) : "Filtre kapalı (" + f_regName(regime) + ")", color.new(regCol, 0))
     f_row(3, "Tahmin / Eşik", na(predLast) ? "- / " + str.tostring(thr * 100, "0.000") + "%" : str.tostring(predLast * 100, "0.0000") + "% / " + str.tostring(thr * 100, "0.000") + "%", color.white)
@@ -372,8 +405,16 @@ if showTable and barstate.islast
 // - Modül 1: 11 özellik, eğitim penceresi ortalama/std'si ile standartlaştırılır; sabit terim cezasızdır (ȳ).
 //   XᵀX, Xᵀy kayan toplamlarla her kapanmış barda döngüyle güncellenir (O(P²)); eğitimde yalnızca P×P ters alınır.
 //   Böylece 5000 barlık pencerede bile tek barda uzun döngü yoktur. Eşik λ·c zaman diliminden bağımsızdır.
-// - Sinyal yalnızca yön değiştiğinde çizilir; hesaplar ve alarmlar barstate.isconfirmed ile kapanmış barda yapılır.
-// - request.security: lookahead_off + close[1] (prim bir bar gecikmelidir).
+// - Profiller (varsayılan Scalp – Agresif):
+//     Profil          | λ   | Eşik (c=0.1%) | Rejim engeli             | Toksik vol | Rejim min. bar | OF bandı | Prim z
+//     Scalp – Agresif | 0.5 | %0.05         | yalnız Toksik            | > %97      | 2              | 1.0      | 3.0
+//     Dengeli         | 1.0 | %0.10         | Toksik + karşı trend     | > %95      | 3              | 0.5      | 2.5
+//     Sıkı            | 2.0 | %0.20         | Toksik + karşı trend     | > %90      | 3              | 0.0      | 2.0
+//     Özel            | "(Özel)" etiketli girdiler
+// - Ok: yön değiştiğinde; "tekrar sinyal aralığı" > 0 ise aynı yönde en az o kadar bar sonra yeniden.
+//   Hesaplar ve alarmlar barstate.isconfirmed ile kapanmış barda yapılır.
+// - request.security: lookahead_off + close[1] (prim bir bar gecikmelidir). Perp/spot sembolleri grafikten türetilir
+//   (BORSA:XXXUSDT.P ↔ BORSA:XXXUSDT); bulunamazsa modül atlanır. Order flow her zaman grafiğin kendi sembolünü kullanır.
 //
 // BİLİNEN SINIRLAMALAR
 // - Ridge modeli ilk "eğitim penceresi" kadar hedefi bilinen örnek birikene kadar sinyal üretmez
@@ -383,6 +424,8 @@ if showTable and barstate.islast
 // - Toksik kontrolü yüzdelik penceresi dolana kadar yapılamaz (tabloda belirtilir); EMA200 dolana kadar rejim yoktur ve
 //   rejim filtresi açıksa sinyal üretilmez.
 // - α mutlak bir cezadır; pencere büyüdükçe etkisi azalır. Model doğrusaldır, getiri tahmini zayıftır; backtest yerine geçmez.
+// - Agresif profil eşiği maliyetin altına indirir (λ<1): sinyal sayısı artar ama her işlem beklenen maliyetini karşılamayabilir.
+// - Farklı adlandırma kullanan borsalarda (ör. …USDT.P yerine …PERP) otomatik perp/spot bulunamaz; manuel sembol girin.
 //
 // DOĞRULAMA – hesaplanan bar değerleri (otomatik ölçek açık, varsayılan süreler)
 // TF  | Eğitim            | Yeniden | Z (7g)        | SMA U/K         | Vol std        | Vol yüzd.          | ER            | Gecikmeler         | OF alt TF
