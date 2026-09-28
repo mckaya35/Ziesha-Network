@@ -188,6 +188,12 @@ var int regCand   = na
 var int regCnt    = 0
 var int lastSig   = 0
 var int lastSigT  = na
+var int rawN      = 0 // tanı sayaçları (yüklü geçmiş)
+var int blkReg    = 0
+var int blkOf     = 0
+var int blkCr     = 0
+var int sameDir   = 0
+var int evN       = 0
 bool buyEvent     = false
 bool sellEvent    = false
 bool regChanged   = false
@@ -290,6 +296,20 @@ if barstate.isconfirmed
     bool crBuy   = not crOn or not crAvail or premZ <= crThr
     bool crSell  = not crOn or not crAvail or premZ >= -crThr
 
+    // Tanı: ham sinyali ilk engelleyen neden
+    if rawDir != 0
+        rawN += 1
+        if not (rawDir == 1 ? regBuy : regSell)
+            blkReg += 1
+        else if not (rawDir == 1 ? ofBuy : ofSell)
+            blkOf += 1
+        else if not (rawDir == 1 ? crBuy : crSell)
+            blkCr += 1
+        else if lastSig == rawDir
+            sameDir += 1
+        else
+            evN += 1
+
     if rawDir == 1 and regBuy and ofBuy and crBuy and lastSig != 1
         buyEvent := true
         lastSig  := 1
@@ -316,7 +336,7 @@ f_regName(r) =>
 f_date(t) =>
     na(t) ? "-" : str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone)
 
-var table tb = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 15), frame_color=color.gray, frame_width=1, border_width=1)
+var table tb = table.new(position.top_right, 2, 16, bgcolor=color.new(color.black, 15), frame_color=color.gray, frame_width=1, border_width=1)
 
 f_row(r, k, v, col) =>
     table.cell(tb, 0, r, k, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
@@ -341,6 +361,8 @@ if showTable and barstate.islast
     f_row(10, "Rejim filtresi", (regOn ? "Açık" : "Kapalı") + (na(volPct) ? " · vol yüzdeliği ısınıyor (toksik kontrolü yok)" : ""), color.white)
     f_row(11, "Order flow", ofTxt, color.white)
     f_row(12, "Futures kalabalık", crTxt, color.white)
+    f_row(14, "Ham sinyal / çizilen ok", str.tostring(rawN) + " / " + str.tostring(evN), color.white)
+    f_row(15, "Ham sinyali engelleyen", "Rejim " + str.tostring(blkReg) + " · OF " + str.tostring(blkOf) + " · Kalabalık " + str.tostring(blkCr) + " · Aynı yön " + str.tostring(sameDir), color.white)
     f_row(13, "Pencereler", warnText == "" ? "Tümü sınırlar içinde" : warnText, warnText == "" ? color.white : color.orange)
 
 // ═════════════════════════════ NOTLAR ═════════════════════════════
