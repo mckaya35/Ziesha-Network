@@ -292,8 +292,8 @@ weight_total(signal1, signal2, signal3, signal4, signal5) =>
 // * Color
 // FIX: switch compares against str.lower(type), so the cases must be lower-case ('TP'/'SL' never matched)
 // *************************************************************************************************************************************************************************************************************************************************************************
-colors(type, value=0) =>
-    switch str.lower(type)
+colors(ctype, value=0) =>
+    switch str.lower(ctype)
         'buy' => color.new(color.aqua, value)
         'sell' => color.new(color.gray, value)
         'tp' => color.new(color.aqua, value)
