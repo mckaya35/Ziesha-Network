@@ -1,0 +1,377 @@
+//@version=6
+indicator("MK Akıllı Sinyal", shorttitle="MK Sinyal", overlay=true, max_labels_count=500, max_bars_back=5000)
+
+// ═════════════════════════════ GİRDİLER ═════════════════════════════
+G_TF  = "Zaman pencereleri"
+G_MDL = "Modül 1 – Getiri tahmini"
+G_REG = "Modül 2 – Rejim filtresi"
+G_OF  = "Modül 3 – Order flow"
+G_CR  = "Modül 4 – Futures kalabalık"
+G_VIS = "Görünüm"
+
+autoScale   = input.bool(true, "Otomatik ölçekleme", group=G_TF, tooltip="Açık: süreler timeframe.in_seconds() ile bar sayısına çevrilir. Kapalı: 1H için geçerli bar değerleri (süre/1 saat) doğrudan kullanılır.")
+trainDays   = input.float(180.0, "Eğitim penceresi (gün)", minval=0.1, group=G_TF, tooltip="Ridge modelinin eğitildiği kayan pencere. Bar karşılığı [300, 5000] aralığına sıkıştırılır.")
+retrainDays = input.float(7.0, "Yeniden eğitim sıklığı (gün)", minval=0.01, group=G_TF, tooltip="Model bu sürede bir yeniden eğitilir. Bar karşılığı [20, 500].")
+zDays       = input.float(7.0, "Hacim / prim z-skoru penceresi (gün)", minval=0.01, group=G_TF, tooltip="Hacim, delta ve prim z-skorlarının penceresi. Bar karşılığı [50, 2000].")
+smaLDays    = input.float(7.0, "SMA uzun (gün)", minval=0.01, group=G_TF, tooltip="close/SMA−1 özelliği için uzun ortalama. Bar karşılığı [5, 2000].")
+smaSDays    = input.float(1.0, "SMA kısa (gün)", minval=0.01, group=G_TF, tooltip="close/SMA−1 özelliği için kısa ortalama. Bar karşılığı [5, 2000].")
+volDays     = input.float(1.0, "Volatilite std penceresi (gün)", minval=0.01, group=G_TF, tooltip="Log getiri standart sapması (özellik + rejim). Bar karşılığı [10, 500].")
+pctDays     = input.float(365.0, "Volatilite yüzdelik penceresi (gün)", minval=1.0, group=G_TF, tooltip="Volatilitenin yüzdelik sırası (toksik rejim). Bar karşılığı [200, 4999]; üst sınır max_bars_back=5000 kaynaklıdır.")
+erDays      = input.float(2.0, "Verimlilik oranı penceresi (gün)", minval=0.01, group=G_TF, tooltip="Kaufman verimlilik oranı. Bar karşılığı [10, 500].")
+lagH1       = input.float(1.0, "Getiri gecikmesi 1 (saat)", minval=0.01, group=G_TF, tooltip="Log getiri özelliği. Bar karşılığı [1, 200]; çakışan gecikmeler sırayla +1 artırılır.")
+lagH2       = input.float(3.0, "Getiri gecikmesi 2 (saat)", minval=0.01, group=G_TF, tooltip="Log getiri özelliği. Bar karşılığı [1, 200].")
+lagH3       = input.float(6.0, "Getiri gecikmesi 3 (saat)", minval=0.01, group=G_TF, tooltip="Log getiri özelliği. Bar karşılığı [1, 200].")
+lagH4       = input.float(12.0, "Getiri gecikmesi 4 (saat)", minval=0.01, group=G_TF, tooltip="Log getiri özelliği. Bar karşılığı [1, 200].")
+lagH5       = input.float(24.0, "Getiri gecikmesi 5 (saat)", minval=0.01, group=G_TF, tooltip="Log getiri özelliği. Bar karşılığı [1, 200].")
+
+alpha = input.float(1.0, "Ridge α", minval=0.000001, group=G_MDL, tooltip="β = (XᵀX + αI)⁻¹Xᵀy. Standartlaştırılmış özelliklerde XᵀX köşegeni ≈ pencere uzunluğu olduğundan α=1 zayıf bir cezadır.")
+costC = input.float(0.001, "İşlem maliyeti c", minval=0.0, step=0.0001, group=G_MDL, tooltip="Pozisyon değişimi başına maliyet (0.001 = %0.1). Zaman diliminden bağımsızdır.")
+lam   = input.float(2.0, "λ (eşik çarpanı)", minval=0.0, step=0.1, group=G_MDL, tooltip="Eşik = λ·c. |tahmin| eşiği aşmazsa sinyal BEKLE.")
+
+regOn      = input.bool(true, "Rejim filtresini kullan", group=G_REG, tooltip="AL yalnızca Trend-Yukarı/Yatay, SAT yalnızca Trend-Aşağı/Yatay rejimde. Toksik rejimde sinyal yok.")
+erThr      = input.float(0.30, "Verimlilik oranı eşiği", minval=0.0, maxval=1.0, step=0.05, group=G_REG, tooltip="ER bu değerin üzerindeyse trend kabul edilir; yön EMA50/EMA200 ile belirlenir.")
+toxPct     = input.float(90.0, "Toksik volatilite yüzdeliği", minval=0.0, maxval=100.0, group=G_REG, tooltip="Volatilite yüzdelik sırası bunun üzerindeyse rejim Toksik.")
+minRegBars = input.int(3, "Rejim değişimi için min. bar", minval=1, group=G_REG, tooltip="Yeni rejim bu kadar ardışık bar sürmeden kabul edilmez.")
+bgTransp   = input.int(88, "Arka plan saydamlığı (%)", minval=0, maxval=100, group=G_REG, tooltip="Rejim arka plan renginin saydamlığı.")
+
+ofOn   = input.bool(false, "Order flow teyidini kullan", group=G_OF, tooltip="AL için delta z > 0, SAT için delta z < 0 şartı. Alt TF verisi yoksa modül atlanır.")
+ofTfIn = input.string("Otomatik", "Alt zaman dilimi", options=["Otomatik", "1", "3", "5", "15", "30", "60", "120", "240", "1D"], group=G_OF, tooltip="Otomatik: grafik barı başına ~12 alt mum. Alt dilim grafikten küçük olmalı; değilse modül atlanır.")
+
+crOn    = input.bool(false, "Kalabalık filtresini kullan", group=G_CR, tooltip="Prim z > +eşik iken AL, prim z < −eşik iken SAT verilmez. Veri yoksa modül atlanır.")
+perpSym = input.symbol("BINANCE:BTCUSDT.P", "Perpetual sembol", group=G_CR, tooltip="Primin hesaplandığı vadeli sembol.")
+spotSym = input.symbol("BINANCE:BTCUSDT", "Spot sembol", group=G_CR, tooltip="Primin hesaplandığı spot sembol.")
+crThr   = input.float(2.0, "Prim z eşiği", minval=0.0, step=0.1, group=G_CR, tooltip="Prim = (perp−spot)/spot×100; z-skoru bu eşiği aşınca ilgili yön engellenir.")
+
+showTable = input.bool(true, "Bilgi tablosunu göster", group=G_VIS, tooltip="Sağ üstte durum tablosu.")
+lblSizeIn = input.string("Normal", "Etiket boyutu", options=["Küçük", "Normal", "Büyük"], group=G_VIS, tooltip="AL/SAT etiketlerinin boyutu.")
+
+// ═════════════════════════════ PENCERELER ═════════════════════════════
+DAY  = 86400.0
+HOUR = 3600.0
+P    = 11 // özellik sayısı
+
+tfSecChart = timeframe.in_seconds()
+tfSec      = autoScale ? tfSecChart : 3600
+
+f_bars(sec, lo, hi) =>
+    math.max(lo, math.min(hi, math.round(sec / tfSec)))
+
+f_warn(name, sec, lo, hi) =>
+    raw = math.round(sec / tfSec)
+    raw > hi ? name + ": Pencere kırpıldı: " + str.tostring(sec / DAY, "#.##") + " gün yerine " + str.tostring(hi * tfSec / DAY, "#.##") + " gün" : raw < lo ? name + ": Kısa geçmiş: az veri" : ""
+
+f_join(a, b) =>
+    a == "" ? b : b == "" ? a : a + "\n" + b
+
+trainW   = f_bars(trainDays * DAY, 300, 5000)
+retrainN = f_bars(retrainDays * DAY, 20, 500)
+zLen     = f_bars(zDays * DAY, 50, 2000)
+smaLLen  = f_bars(smaLDays * DAY, 5, 2000)
+smaSLen  = f_bars(smaSDays * DAY, 5, 2000)
+volLen   = f_bars(volDays * DAY, 10, 500)
+pctLen   = f_bars(pctDays * DAY, 200, 4999)
+erLen    = f_bars(erDays * DAY, 10, 500)
+
+// Gecikmeler: önce artan geçişle farklılaştır, sonra 200 tavanına geriye doğru sığdır.
+a1 = f_bars(lagH1 * HOUR, 1, 200)
+a2 = math.max(f_bars(lagH2 * HOUR, 1, 200), a1 + 1)
+a3 = math.max(f_bars(lagH3 * HOUR, 1, 200), a2 + 1)
+a4 = math.max(f_bars(lagH4 * HOUR, 1, 200), a3 + 1)
+a5 = math.max(f_bars(lagH5 * HOUR, 1, 200), a4 + 1)
+L5 = math.min(a5, 200)
+L4 = math.min(a4, L5 - 1)
+L3 = math.min(a3, L4 - 1)
+L2 = math.min(a2, L3 - 1)
+L1 = math.min(a1, L2 - 1)
+
+warnText = f_join(f_join(f_join(f_warn("Eğitim", trainDays * DAY, 300, 5000), f_warn("Z-skoru", zDays * DAY, 50, 2000)), f_join(f_warn("SMA uzun", smaLDays * DAY, 5, 2000), f_warn("SMA kısa", smaSDays * DAY, 5, 2000))), f_join(f_join(f_warn("Vol std", volDays * DAY, 10, 500), f_warn("Vol yüzdelik", pctDays * DAY, 200, 4999)), f_warn("Verimlilik", erDays * DAY, 10, 500)))
+
+// ═════════════════════════════ ÖZELLİKLER (yalnızca geçmiş) ═════════════════════════════
+f_z(x, n) =>
+    m = ta.sma(x, n)
+    s = ta.stdev(x, n)
+    s > 0 ? (x - m) / s : na
+
+lc   = math.log(close)
+r1   = lc - lc[1]
+rsiV = ta.rsi(close, 14)
+smaS = ta.sma(close, smaSLen)
+smaL = ta.sma(close, smaLLen)
+atrV = ta.atr(14)
+volStd = ta.stdev(r1, volLen)
+volZ   = f_z(volume, zLen)
+
+fL1 = lc - lc[L1]
+fL2 = lc - lc[L2]
+fL3 = lc - lc[L3]
+fL4 = lc - lc[L4]
+fL5 = lc - lc[L5]
+fR  = (rsiV - 50) / 50
+fS  = close / smaS - 1
+fL  = close / smaL - 1
+fA  = atrV / close
+fVz = na(volume) ? 0.0 : volZ // hacmi olmayan sembollerde özellik sabit 0
+
+// ═════════════════════════════ REJİM GİRDİLERİ ═════════════════════════════
+erNoise = math.sum(math.abs(close - close[1]), erLen)
+er      = erNoise > 0 ? math.abs(close - close[erLen]) / erNoise : na
+emaF    = ta.ema(close, 50)
+emaS    = ta.ema(close, 200)
+volPct  = ta.percentrank(volStd, pctLen)
+
+// ═════════════════════════════ ORDER FLOW (alt TF) ═════════════════════════════
+f_autoLtf(s) =>
+    s <= 60 ? "" : s <= 900 ? "1" : s <= 1800 ? "3" : s <= 3600 ? "5" : s <= 14400 ? "15" : s <= 21600 ? "30" : s <= 86400 ? "60" : "1D"
+
+ltfWanted = ofTfIn == "Otomatik" ? f_autoLtf(tfSecChart) : ofTfIn
+ltfOk     = ltfWanted != "" and timeframe.in_seconds(ltfWanted) < tfSecChart
+ltfUse    = ltfOk ? ltfWanted : timeframe.period
+
+[ic, io, iv] = request.security_lower_tf(syminfo.tickerid, ltfUse, [close, open, volume], ignore_invalid_symbol=true, ignore_invalid_timeframe=true)
+
+float ofRatio = na
+if ltfOk and array.size(ic) > 0
+    float d  = 0.0
+    float tv = 0.0
+    for i = 0 to array.size(ic) - 1
+        v  = nz(array.get(iv, i))
+        c_ = array.get(ic, i)
+        o_ = array.get(io, i)
+        d  += c_ > o_ ? v : c_ < o_ ? -v : 0.0 // eşitse yarı alış/yarı satış → net 0
+        tv += v
+    ofRatio := tv > 0 ? d / tv : na
+ofZ     = f_z(ofRatio, zLen)
+ofAvail = ltfOk and not na(ofZ)
+
+// ═════════════════════════════ FUTURES PRİMİ ═════════════════════════════
+perpC   = request.security(perpSym, timeframe.period, close[1], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+spotC   = request.security(spotSym, timeframe.period, close[1], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+prem    = spotC > 0 ? (perpC - spotC) / spotC * 100 : na
+premZ   = f_z(prem, zLen)
+crAvail = not na(premZ)
+
+// ═════════════════════════════ RIDGE MODELİ ═════════════════════════════
+type Sample
+    array<float> x
+    float y
+
+var array<Sample> buf  = array.new<Sample>()
+var array<float>  sx   = array.new_float(P, 0.0)
+var array<float>  sxy  = array.new_float(P, 0.0)
+var array<float>  sxx  = array.new_float(P * P, 0.0)
+var array<float>  prevX = array.new_float(0)
+var array<float>  mu   = array.new_float(P, 0.0)
+var array<float>  sd   = array.new_float(P, 1.0)
+var array<float>  beta = array.new_float(P, 0.0)
+var float sy         = 0.0
+var float sAbs       = 0.0
+var float yBar       = 0.0
+var float avgMove    = na
+var bool  trained    = false
+var int   sinceTrain = 0
+var int   lastTrainT = na
+var float predLast   = na
+
+// Kayan pencere toplamları: örnek ekle (sgn=1) / çıkar (sgn=−1). Bar başına O(P²).
+f_update(array<float> x, float y, float sgn) =>
+    for i = 0 to P - 1
+        xi = x.get(i)
+        sx.set(i, sx.get(i) + sgn * xi)
+        sxy.set(i, sxy.get(i) + sgn * xi * y)
+        for j = i to P - 1
+            k = i * P + j
+            sxx.set(k, sxx.get(k) + sgn * xi * x.get(j))
+
+// ═════════════════════════════ DURUM (yalnızca kapanmış bar) ═════════════════════════════
+var int regime    = na
+var int regCand   = na
+var int regCnt    = 0
+var int lastSig   = 0
+var int lastSigT  = na
+bool buyEvent     = false
+bool sellEvent    = false
+bool regChanged   = false
+thr     = lam * costC
+lblSize = lblSizeIn == "Küçük" ? size.small : lblSizeIn == "Büyük" ? size.large : size.normal
+
+if barstate.isconfirmed
+    xNow = array.from(fL1, fL2, fL3, fL4, fL5, fR, fS, fL, fA, volStd, fVz)
+    bool xOk = true
+    for i = 0 to P - 1
+        if na(xNow.get(i))
+            xOk := false
+
+    // Önceki barın özellikleri + bu barın getirisi = hedefi bilinen yeni örnek
+    if prevX.size() == P and not na(r1)
+        f_update(prevX, r1, 1.0)
+        sy   += r1
+        sAbs += math.abs(r1)
+        buf.push(Sample.new(prevX, r1))
+        if buf.size() > trainW
+            old = buf.shift()
+            f_update(old.x, old.y, -1.0)
+            sy   -= old.y
+            sAbs -= math.abs(old.y)
+    prevX := xOk ? xNow : array.new_float(0)
+
+    if trained
+        sinceTrain += 1
+    if buf.size() >= trainW and (not trained or sinceTrain >= retrainN)
+        n  = float(buf.size())
+        ym = sy / n
+        for i = 0 to P - 1
+            m = sx.get(i) / n
+            vr = sxx.get(i * P + i) / n - m * m
+            mu.set(i, m)
+            sd.set(i, vr > 1e-14 ? math.sqrt(vr) : 1.0)
+        matrix<float> A = matrix.new<float>(P, P, 0.0)
+        array<float>  b = array.new_float(P, 0.0)
+        for i = 0 to P - 1
+            mi = mu.get(i)
+            si = sd.get(i)
+            b.set(i, (sxy.get(i) - n * mi * ym) / si)
+            for j = i to P - 1
+                val = (sxx.get(i * P + j) - n * mi * mu.get(j)) / (si * sd.get(j))
+                A.set(i, j, val)
+                A.set(j, i, val)
+        for i = 0 to P - 1
+            A.set(i, i, A.get(i, i) + alpha)
+        matrix<float> Ai = A.inv()
+        for i = 0 to P - 1
+            float bi = 0.0
+            for j = 0 to P - 1
+                bi += Ai.get(i, j) * b.get(j)
+            beta.set(i, bi)
+        yBar       := ym
+        avgMove    := sAbs / n
+        trained    := true
+        sinceTrain := 0
+        lastTrainT := time
+
+    if trained and xOk
+        float p_ = yBar
+        for i = 0 to P - 1
+            p_ += beta.get(i) * (xNow.get(i) - mu.get(i)) / sd.get(i)
+        predLast := p_
+    else
+        predLast := na
+
+    // Rejim: 0 Yatay, 1 Trend-Yukarı, 2 Trend-Aşağı, 3 Toksik
+    int rawReg = na
+    if not na(er) and not na(emaS)
+        bool toxic = not na(volPct) and volPct > toxPct
+        rawReg := toxic ? 3 : er > erThr and emaF > emaS ? 1 : er > erThr and emaF < emaS ? 2 : 0
+    if not na(rawReg)
+        if na(regime)
+            regime := rawReg
+        else if rawReg == regime
+            regCand := na
+            regCnt  := 0
+        else
+            if not na(regCand) and rawReg == regCand
+                regCnt += 1
+            else
+                regCand := rawReg
+                regCnt  := 1
+            if regCnt >= minRegBars
+                regime     := rawReg
+                regCand    := na
+                regCnt     := 0
+                regChanged := true
+
+    // Sinyal
+    int rawDir = 0
+    if trained and not na(predLast)
+        rawDir := predLast > thr ? 1 : predLast < -thr ? -1 : 0
+    bool regBuy  = not regOn or (not na(regime) and (regime == 1 or regime == 0))
+    bool regSell = not regOn or (not na(regime) and (regime == 2 or regime == 0))
+    bool ofBuy   = not ofOn or not ofAvail or ofZ > 0
+    bool ofSell  = not ofOn or not ofAvail or ofZ < 0
+    bool crBuy   = not crOn or not crAvail or premZ <= crThr
+    bool crSell  = not crOn or not crAvail or premZ >= -crThr
+
+    if rawDir == 1 and regBuy and ofBuy and crBuy and lastSig != 1
+        buyEvent := true
+        lastSig  := 1
+        lastSigT := time
+        label.new(bar_index, low, "AL", yloc=yloc.belowbar, color=color.green, style=label.style_triangleup, textcolor=color.green, size=lblSize)
+    else if rawDir == -1 and regSell and ofSell and crSell and lastSig != -1
+        sellEvent := true
+        lastSig   := -1
+        lastSigT  := time
+        label.new(bar_index, high, "SAT", yloc=yloc.abovebar, color=color.red, style=label.style_triangledown, textcolor=color.red, size=lblSize)
+
+// ═════════════════════════════ ÇIKTILAR ═════════════════════════════
+regCol = regime == 1 ? color.green : regime == 2 ? color.red : regime == 3 ? color.purple : color.gray
+bgcolor(regOn and not na(regime) ? color.new(regCol, bgTransp) : na, title="Rejim arka planı")
+plot(regime, "Rejim kodu", display=display.none)
+
+alertcondition(buyEvent, "MK AL", "MK AL | {{ticker}} | Fiyat: {{close}}")
+alertcondition(sellEvent, "MK SAT", "MK SAT | {{ticker}} | Fiyat: {{close}}")
+alertcondition(regChanged, "Rejim değişti", 'MK Rejim değişti | {{ticker}} | Fiyat: {{close}} | Kod (0 Yatay, 1 Yukarı, 2 Aşağı, 3 Toksik): {{plot("Rejim kodu")}}')
+
+f_regName(r) =>
+    na(r) ? "Veri yetersiz" : r == 1 ? "Trend-Yukarı" : r == 2 ? "Trend-Aşağı" : r == 3 ? "Toksik" : "Yatay"
+
+f_date(t) =>
+    na(t) ? "-" : str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone)
+
+var table tb = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 15), frame_color=color.gray, frame_width=1, border_width=1)
+
+f_row(r, k, v, col) =>
+    table.cell(tb, 0, r, k, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, r, v, text_color=col, text_size=size.small, text_halign=text.align_left)
+
+if showTable and barstate.islast
+    mv    = trained ? avgMove : buf.size() > 0 ? sAbs / buf.size() : na
+    ratio = mv > 0 ? thr / mv : na
+    ofTxt = (ofOn ? "Açık" : "Kapalı") + " · " + (ltfWanted == "" and ofTfIn == "Otomatik" ? "1m'de order flow yok (atlandı)" : not ltfOk ? "Alt TF grafikten küçük değil (atlandı)" : ofAvail ? ltfUse + " · z=" + str.tostring(ofZ, "0.00") : "Veri yok (atlandı)")
+    crTxt = (crOn ? "Açık" : "Kapalı") + " · " + (crAvail ? "Prim z=" + str.tostring(premZ, "0.00") : "Veri yok (atlandı)")
+    sigTxt = lastSig == 1 ? "AL · " + f_date(lastSigT) : lastSig == -1 ? "SAT · " + f_date(lastSigT) : "-"
+    f_row(0, "MK Akıllı Sinyal", "TF " + timeframe.period + (autoScale ? " · otomatik ölçek" : " · 1H bar değerleri"), color.white)
+    f_row(1, "Son sinyal", sigTxt, lastSig == 1 ? color.lime : lastSig == -1 ? color.red : color.white)
+    f_row(2, "Rejim", regOn ? f_regName(regime) : "Filtre kapalı (" + f_regName(regime) + ")", color.new(regCol, 0))
+    f_row(3, "Tahmin / Eşik", na(predLast) ? "- / " + str.tostring(thr * 100, "0.000") + "%" : str.tostring(predLast * 100, "0.0000") + "% / " + str.tostring(thr * 100, "0.000") + "%", color.white)
+    f_row(4, "Sinyal gücü", na(predLast) or thr <= 0 ? "-" : str.tostring(math.abs(predLast) / thr, "0.0") + "x", color.white)
+    f_row(5, "Model", trained ? "Hazır (" + str.tostring(trainW) + " bar)" : "Model ısınıyor: " + str.tostring(buf.size()) + "/" + str.tostring(trainW) + " bar", trained ? color.lime : color.orange)
+    f_row(6, "Son eğitim", f_date(lastTrainT), color.white)
+    f_row(7, "Bar başına ort. |hareket|", na(mv) ? "-" : str.tostring(mv * 100, "0.000") + "%", color.white)
+    f_row(8, "Eşik / ort. hareket", na(ratio) ? "-" : str.tostring(ratio, "0.00"), ratio > 3 ? color.orange : color.white)
+    f_row(9, "Uyarı", ratio > 3 ? "Bu zaman diliminde maliyet eşiği bar hareketine göre yüksek, sinyal çok seyrek olabilir" : "-", ratio > 3 ? color.orange : color.white)
+    f_row(10, "Rejim filtresi", (regOn ? "Açık" : "Kapalı") + (na(volPct) ? " · vol yüzdeliği ısınıyor (toksik kontrolü yok)" : ""), color.white)
+    f_row(11, "Order flow", ofTxt, color.white)
+    f_row(12, "Futures kalabalık", crTxt, color.white)
+    f_row(13, "Pencereler", warnText == "" ? "Tümü sınırlar içinde" : warnText, warnText == "" ? color.white : color.orange)
+
+// ═════════════════════════════ NOTLAR ═════════════════════════════
+// AYARLAR
+// - Süreler (gün/saat) otomatik ölçeklemede bar = round(süre_sn / timeframe.in_seconds()) ile çevrilir ve [min, max]'a sıkıştırılır.
+//   Kapalıyken 1H değerleri (süre / 3600 sn) kullanılır. RSI/ATR 14 bar, EMA50/EMA200 bar olarak sabittir.
+// - Modül 1: 11 özellik, eğitim penceresi ortalama/std'si ile standartlaştırılır; sabit terim cezasızdır (ȳ).
+//   XᵀX, Xᵀy kayan toplamlarla her kapanmış barda döngüyle güncellenir (O(P²)); eğitimde yalnızca P×P ters alınır.
+//   Böylece 5000 barlık pencerede bile tek barda uzun döngü yoktur. Eşik λ·c zaman diliminden bağımsızdır.
+// - Sinyal yalnızca yön değiştiğinde çizilir; hesaplar ve alarmlar barstate.isconfirmed ile kapanmış barda yapılır.
+// - request.security: lookahead_off + close[1] (prim bir bar gecikmelidir).
+//
+// BİLİNEN SINIRLAMALAR
+// - Ridge modeli ilk "eğitim penceresi" kadar hedefi bilinen örnek birikene kadar sinyal üretmez
+//   (1H: 4320 örnek + ~168 bar özellik ısınması ≈ 4490 bar). Grafikte yüklenen bar sayısı plana göre sınırlıdır.
+// - Alt zaman dilimi verisinin (request.security_lower_tf) geçmişi sınırlıdır; eski barlarda order flow "veri yok" olur ve atlanır.
+// - Vol yüzdelik penceresi max_bars_back=5000 nedeniyle en fazla 4999 bardır (1H'de 365 gün yerine ~208 gün).
+// - Toksik kontrolü yüzdelik penceresi dolana kadar yapılamaz (tabloda belirtilir); EMA200 dolana kadar rejim yoktur ve
+//   rejim filtresi açıksa sinyal üretilmez.
+// - α mutlak bir cezadır; pencere büyüdükçe etkisi azalır. Model doğrusaldır, getiri tahmini zayıftır; backtest yerine geçmez.
+//
+// DOĞRULAMA – hesaplanan bar değerleri (otomatik ölçek açık, varsayılan süreler)
+// TF  | Eğitim            | Yeniden | Z (7g)        | SMA U/K         | Vol std        | Vol yüzd.          | ER            | Gecikmeler         | OF alt TF
+// 1m  | 5000 (kırp: 3.47g)| 500     | 2000 (1.39g)  | 2000(kırp)/1440 | 500 (0.35g)    | 4999 (3.47g)       | 500 (0.35g)   | 60,180,198,199,200 | yok
+// 5m  | 5000 (17.36g)     | 500     | 2000 (6.94g)  | 2000(kırp)/288  | 288            | 4999 (17.36g)      | 500 (1.74g)   | 12,36,72,144,200   | 1 (5 mum)
+// 15m | 5000 (52.08g)     | 500     | 672           | 672/96          | 96             | 4999 (52.07g)      | 192           | 4,12,24,48,96      | 1 (15 mum)
+// 1H  | 4320              | 168     | 168           | 168/24          | 24             | 4999 (208.3g)      | 48            | 1,3,6,12,24        | 5 (12 mum)
+// 4H  | 1080              | 42      | 50 (min)      | 42/6            | 10 (min)       | 2190               | 12            | 1,2,3,4,6          | 15 (16 mum)
+// 1D  | 300 (min, kısa)   | 20 (min)| 50 (min)      | 7/5 (min)       | 10 (min)       | 365                | 10 (min)      | 1,2,3,4,5          | 60 (24 mum)
+// 1W  | 300 (min, kısa)   | 20 (min)| 50 (min)      | 5/5 (min)       | 10 (min)       | 200 (min)          | 10 (min)      | 1,2,3,4,5          | 1D (7 mum)
+// Kontrol: 1H değerleri orijinal tasarımla aynı (yüzdelik hariç). 1m–15m'de uzun pencereler kırpılır → model yalnızca son
+// günleri görür. 1D/1W'de alt sınırlar süreyi uzatır: 1W'de 300 bar ≈ 5.8 yıl eğitim + EMA200 = 200 hafta; BTCUSDT.P
+// (Eylül 2019'dan beri) için sinyal ancak son aylarda başlayabilir. 1m'de c=0.1% eşiği tipik bar hareketinin birkaç katı
+// olabileceğinden tabloda "Eşik / ort. hareket" uyarısı beklenir.
